@@ -1,0 +1,40 @@
+{
+ "_note": "Curated board roster (LEAN, data-backed 2026-09-14). 'always_include' = CONSTANT panel contributors queried every round. 'active_cf_optional' = extra CF models pulled in when their take matters. 'code_suggesters' = models emitting runnable TARGET/CODE/ORACLE blocks (via code_suggester.py) which the co-pilot RUNS + confirms. 'consultants' = analyst/second-opinion. 'dropped'/'unavailable' kept for the record with the reason. Trimmed from 16 -> 10 active on this session's per-consult on-task rates + a latency health-check: kept full lineage diversity (Anthropic/DeepSeek/OpenAI/Mistral/Qwen/Meta/Moonshot), dropped the consistently-low-signal + redundant members. External members (claude/deepseek-direct) bill separately; CF models spend Neurons. Latency note: qwq-32b + deepseek-r1-distill are reasoning models (4-8s, longer under load) -- bound with AEGIS_CF_TIMEOUT and skip the code-bench (AEGIS_NOVEL_CODE=0) for latency-sensitive runs. | 2026-10-02: +groq (free, best-of-3 top); -kimi (latency). Live bench: tier_bench --suite security --repeat 3. | 2026-10-02: reconciled code_suggesters to the runtime CODE_SUGGESTERS; -nemotron-120b. | 2026-10-02: consolidator -> groq (free gpt-oss-120b; consolidation bake-off 6/6); qwq-32b demoted to optional prose-dissent. | 2026-10-02 (peer-validated): analyst/consolidator = gpt-oss-120b via CF (NOT groq-free: large consolidation input exceeds groq TPM); degenerate-output guard added to review_suggestions; groq stays a coder.",
+ "code_suggesters": {
+  "qwen2.5-coder-32b": "CF exploit-code specialist (baked role in cf_agent.ROLE_PROMPTS).",
+  "deepseek-direct": "DeepSeek v4-pro/v4-flash via api.deepseek.com -- reached DIRECTLY; reliable (5/5 on-task this session).",
+  "llama-3.3-70b": "@cf/meta/llama-3.3-70b-instruct-fp8-fast -- FAST direct coder, best price/latency of the CF coders.",
+  "llama-4-scout": "@cf/meta/llama-4-scout-17b-16e-instruct -- Llama-4 MoE coder; TOPPED the code-review bake-off, fast + cheap.",
+  "gpt-oss-120b": "openai/gpt-oss-120b via GROQ (free). Security best-of-3 top scorer. Writer + board breadth (two roles; free so a few extra calls are fine)."
+ },
+ "consultants": {
+  "gpt-oss-120b": "@cf/openai/gpt-oss-120b via CLOUDFLARE -- ANALYST/VERIFIER/CONSOLIDATOR. Bake-off winner (6/6). Served via CF (128k ctx, no TPM wall): the whole-suggestion-set input would 429/degenerate on groq-free. groq is a CODER seat only.",
+  "qwq-32b": "@cf/qwen/qwq-32b -- DEMOTED 2026-10-02: 413/400 on board-sized consolidation input (24k ceiling) and 0/6 emitting a consolidated answer. Optional prose-dissent only."
+ },
+ "always_include": {
+  "claude": "overseer/verifier, highest signal-per-byte (5/5) -- answers DIRECTLY via the coordinator (board_ask --claude); NOT an API call/key.",
+  "deepseek-direct": "DeepSeek V4 -- concise + broad, reliable (5/5); direct call (external).",
+  "gpt-oss-120b": "@cf/openai/gpt-oss-120b lineage, now served via GROQ (free) -- OpenAI-lineage breadth/dissent on the board.",
+  "mistral-small-24b": "@cf/mistralai/mistral-small-3.1-24b-instruct -- distinct Mistral lineage, non-reasoning -> fast/clean/cheap (3/5)."
+ },
+ "active_cf_optional": {
+  "qwen2.5-coder-32b": "@cf/qwen/qwen2.5-coder-32b-instruct"
+ },
+ "dropped": {
+  "gpt-oss-20b": "REDUNDANT with gpt-oss-120b (same OpenAI lineage); 2/5 on-task. Kept 120b for the lineage, dropped 20b (2026-09-14).",
+  "kimi-k2.6": "0/5 on-task this session (read-timeouts / empty replies); REDUNDANT with kimi-k2.7-code which is kept. Dropped 2026-09-14.",
+  "gemma-4-26b": "1/5 on-task (mostly generic/off-task); REDUNDANT with mistral-small-24b (cheap non-reasoning breadth) which is kept. Dropped 2026-09-14.",
+  "nemotron-120b": "@cf/nvidia/nemotron-3-120b-a12b -- DROPPED 2026-10-02 (1/5 on-task + expensive; not in the security best-of-3).",
+  "glm-5.2": "1/4 on-task (mostly generic). Dropped 2026-09-14.",
+  "sea-lion-27b": "terse, redundant with gemma.",
+  "qwen3-30b-a3b-fp8": "redundant with qwen2.5-coder.",
+  "sol": "GPT-5.6 (OpenAI, external) -- BOOTED 2026-09-10: worst cost/value, content-gated (frequent refusals on this stack's security content -> 0/5 on-task), verbose. Its distinct-lineage dissent is covered by gpt-oss-120b.",
+  "kimi-k2.7-code": "@cf/moonshotai/kimi-k2.7-code -- accurate (best-of-3: 8/8 easy, 9/9 hard) BUT 70-356s latency; DROPPED from coders 2026-10-02 (too slow for board fan-out; also flaked very-hard 0/9). Chat seat only.",
+  "deepseek-r1-distill-32b": "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b -- DROPPED 2026-09-20 (timed out to empty/unreliable on CF); not in the runtime bench."
+ },
+ "unavailable": {
+  "glm-5.3": "403",
+  "deepseek-v4-pro-cf": "403 (DeepSeek reached directly instead)",
+  "qwen3.8-27b": "empty responses"
+ }
+}

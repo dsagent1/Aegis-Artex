@@ -1,0 +1,49 @@
+{
+  "owner": "<your name/org \u2014 self-owned asset or written client authorization>",
+  "engagement": "<engagement-id>",
+  "approver": "<who authorized this>",
+  "authorized_at": "2026-01-01",
+  "expires_at": "2026-12-31",
+  "scope": {
+    "hosts": [
+      "mirror.local",
+      "127.0.0.1"
+    ],
+    "cidrs": [],
+    "domains": [
+      "example.test"
+    ]
+  },
+  "rules_of_engagement": {
+    "allowed_actions": [
+      "recon",
+      "web",
+      "fact",
+      "authz",
+      "supply_chain",
+      "static",
+      "misconfig",
+      "rag"
+    ],
+    "safe_recon_hosts": [
+      "mirror.local",
+      "127.0.0.1"
+    ],
+    "safe_recon_domains": [
+      "example.test"
+    ],
+    "extra_research_hosts": [],
+    "goal": "mirror.local",
+    "pivot_map": {
+      "mirror.local": []
+    },
+    "escalate_frac": 0.15,
+    "max_escalate_steps": 3,
+    "destructive": false,
+    "allowed_destructive_tests": [],
+    "destructive_tests": {},
+    "evasion": "none",
+    "persistence": "none",
+    "scope_notes": "Contained mirror only by default. Red-Team is FAIL-CLOSED: it refuses to run without a valid, in-date authorization.json naming hosts you are authorized to test."
+  }
+}

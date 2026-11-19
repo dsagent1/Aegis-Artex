@@ -1,0 +1,264 @@
+"""kali_tool_extend.py -- extend the Kali toolbox with tools that ship in other pentest distros
+(BlackArch ~2800 tools, BackBox, Predator-OS) but are MISSING from this Kali, on demand for a specific probe.
+
+Design (per the doctrine): we do NOT graft another distro's package repos (BlackArch is Arch/pacman -- can't
+mix with Kali/Debian; BackBox/Predator .debs risk dependency breakage). Instead we install the SPECIFIC
+missing tool from its upstream, trying sources in order until the binary appears:
+    apt -> pipx -> pip -> go install -> cargo install -> gem -> npm -> git clone+build -> docker image
+Installing tooling is the authorized-tooling lane (not target egress); contained in Kali.
+
+  check           -- which CATALOG tools are missing on this Kali
+  list            -- the curated cross-distro catalog
+  install <name>  -- resolve + install one tool (best source), verify the binary lands
+  diff            -- catalog vs Kali (present/missing table)
+  refresh         -- (opt-in, AEGIS_TOOLS_ONLINE=1) pull the live BlackArch tool list to expand the catalog
+
+The catalog seeds high-value tools commonly present in BlackArch and absent/older in a stock Kali; the
+RESOLVER works for ANY name (the catalog is discovery + an install hint, not a hard dependency).
+"""
+from __future__ import annotations
+import os, sys, json, subprocess, platform, re
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+KALI = os.environ.get("AEGIS_KALI_DISTRO", "kali-linux")
+_CATALOG_PATH = os.path.join(HERE, "kali_tool_catalog.json")
+
+# Curated seed: tools that BlackArch/BackBox/Predator ship and a stock Kali often lacks (or ships older).
+# Each: {bin, distros, category, install:[(method, target)]}. `bin` is what we test with `command -v`.
+_SEED = {
+    # projectdiscovery / recon (go) -- some are in kali now; have() decides. BlackArch ships the full set.
+    "dalfox":        {"bin": "dalfox", "distros": ["blackarch"], "category": "web/xss",
+                       "install": [("go", "github.com/hahwul/dalfox/v2@latest")]},
+    "gau":           {"bin": "gau", "distros": ["blackarch"], "category": "recon/urls",
+                       "install": [("go", "github.com/lc/gau/v2/cmd/gau@latest")]},
+    "waybackurls":   {"bin": "waybackurls", "distros": ["blackarch"], "category": "recon/urls",
+                       "install": [("go", "github.com/tomnomnom/waybackurls@latest")]},
+    "katana":        {"bin": "katana", "distros": ["blackarch"], "category": "web/crawler",
+                       "install": [("apt", "katana"), ("go", "github.com/projectdiscovery/katana/cmd/katana@latest")]},
+    "hakrawler":     {"bin": "hakrawler", "distros": ["blackarch"], "category": "web/crawler",
+                       "install": [("go", "github.com/hakluke/hakrawler@latest")]},
+    "gowitness":     {"bin": "gowitness", "distros": ["blackarch"], "category": "web/screenshot",
+                       "install": [("go", "github.com/sensepost/gowitness@latest")]},
+    "arjun":         {"bin": "arjun", "distros": ["blackarch"], "category": "web/params",
+                       "install": [("pipx", "arjun")]},
+    "xnLinkFinder":  {"bin": "xnLinkFinder", "distros": ["blackarch"], "category": "web/endpoints",
+                       "install": [("pipx", "xnLinkFinder")]},
+    "interactsh-client": {"bin": "interactsh-client", "distros": ["blackarch"], "category": "oob",
+                       "install": [("go", "github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest")]},
+    # post-exploit / C2 / pivot
+    "pwncat-cs":     {"bin": "pwncat-cs", "distros": ["blackarch"], "category": "post-exploit",
+                       "install": [("pipx", "pwncat-cs")]},
+    "ligolo-ng":     {"bin": "ligolo-ng", "distros": ["blackarch"], "category": "pivot",
+                       "install": [("go", "github.com/nicocha30/ligolo-ng/cmd/proxy@latest")]},
+    # C2 frameworks -- for AUTHORIZED, CONTAINED self-testing (parity with the commercial suites:
+    # Cobalt Strike / Metasploit / Caldera all ship interactive C2). BOTH are KALI-NATIVE (apt), so the
+    # doctrine's resolution order applies: Kali apt FIRST, then BlackArch/upstream only as a fallback for
+    # a Kali that lacks them. Driven by redteam/c2.py. GATED: category "c2" installs ONLY with
+    # AEGIS_C2_ENABLE=1 (opt-in). Containment, not abstinence -- server + implants stay in the owned lab.
+    "sliver":        {"bin": "sliver-server", "distros": ["kali", "blackarch"], "category": "c2",
+                       "install": [("apt", "sliver"),
+                                   ("script", "curl https://sliver.sh/install|sudo bash"),
+                                   ("go", "github.com/BishopFox/sliver/server@latest")]},
+    "villain":       {"bin": "villain", "distros": ["kali", "blackarch"], "category": "c2",
+                       "install": [("apt", "villain"),
+                                   ("git", "https://github.com/t3l3machus/Villain")]},
+    # osint / recon
+    "sn0int":        {"bin": "sn0int", "distros": ["blackarch"], "category": "osint",
+                       "install": [("apt", "sn0int"), ("cargo", "sn0int")]},
+    "cero":          {"bin": "cero", "distros": ["blackarch"], "category": "recon/certs",
+                       "install": [("go", "github.com/glebarez/cero@latest")]},
+    # fuzz / brute
+    "x8":            {"bin": "x8", "distros": ["blackarch"], "category": "web/params",
+                       "install": [("cargo", "x8")]},
+    "feroxbuster":   {"bin": "feroxbuster", "distros": ["blackarch", "backbox"], "category": "web/content",
+                       "install": [("apt", "feroxbuster"), ("cargo", "feroxbuster")]},
+    # mobile (relevant to the ANDROID work)
+    "apkleaks":      {"bin": "apkleaks", "distros": ["blackarch"], "category": "mobile/secrets",
+                       "install": [("pipx", "apkleaks")]},
+    "objection":     {"bin": "objection", "distros": ["blackarch"], "category": "mobile/runtime",
+                       "install": [("pipx", "objection")]},
+}
+
+
+def _kali(cmd, timeout=1800):
+    if platform.system() == "Windows":
+        full = ["wsl", "-d", KALI, "-u", "root", "--", "bash", "-lc", cmd]
+        env = dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*")
+    else:
+        full = ["bash", "-lc", cmd]
+        env = dict(os.environ)
+    r = subprocess.run(full, capture_output=True, text=True, timeout=timeout, env=env)
+    return r.returncode, r.stdout, r.stderr
+
+
+def _load_catalog():
+    cat = dict(_SEED)
+    if os.path.exists(_CATALOG_PATH):
+        try:
+            cat.update(json.load(open(_CATALOG_PATH, encoding="utf-8")))
+        except Exception:
+            pass
+    return cat
+
+
+# SECURITY (board review): names are interpolated into `bash -lc`; reject shell metachars before use.
+_SAFE_TOOL = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
+
+
+def _safe_tool(name):
+    return bool(isinstance(name, str) and _SAFE_TOOL.match(name))
+
+
+def have(binname):
+    if not _safe_tool(binname):
+        return False
+    rc, out, _ = _kali(f"command -v {binname} >/dev/null 2>&1 && echo YES || echo NO", timeout=60)
+    return "YES" in out
+
+
+def check():
+    cat = _load_catalog()
+    present, missing = [], []
+    for name, spec in cat.items():
+        (present if have(spec.get("bin", name)) else missing).append(name)
+    print(f"[check] catalog={len(cat)}  present={len(present)}  MISSING={len(missing)}")
+    for name in sorted(missing):
+        spec = cat[name]
+        print(f"  MISSING  {name:18} [{spec.get('category','?')}]  <- {','.join(spec.get('distros',[]))}  "
+              f"install: {spec.get('install',[])[:1]}")
+    return {"present": present, "missing": missing}
+
+
+# ---- the multi-source resolver ----
+def _try(method, target, binname):
+    cmds = {
+        "apt":   f"apt-get install -y {target} >/dev/null 2>&1",
+        "pipx":  f"(command -v pipx || (apt-get install -y pipx >/dev/null 2>&1)); pipx install {target} >/dev/null 2>&1",
+        "pip":   f"pip install --break-system-packages {target} >/dev/null 2>&1 || pip install {target} >/dev/null 2>&1",
+        "go":    f"(command -v go || apt-get install -y golang-go >/dev/null 2>&1); GOBIN=/usr/local/bin go install {target} >/dev/null 2>&1",
+        "cargo": f"(command -v cargo || apt-get install -y cargo >/dev/null 2>&1); cargo install {target} >/dev/null 2>&1 && cp ~/.cargo/bin/{binname} /usr/local/bin/ 2>/dev/null",
+        "gem":   f"gem install {target} >/dev/null 2>&1",
+        "npm":   f"(command -v npm || apt-get install -y npm >/dev/null 2>&1); npm install -g {target} >/dev/null 2>&1",
+        "git":   f"cd /opt && git clone --depth 1 {target} >/dev/null 2>&1",
+        "script":f"{target}",
+        "docker":f"docker pull {target} >/dev/null 2>&1",
+    }
+    c = cmds.get(method)
+    if not c:
+        return False, f"unknown method {method}"
+    rc, out, err = _kali(c, timeout=1200)
+    return (rc == 0), (err or out)[-200:]
+
+
+# TIERED TRUST (board): official package indexes auto-install under the tooling lane; the arbitrary-code
+# class (git clone+build, curl|bash script, pulling an untrusted image) is GATED -- runs only with approval.
+_AUTO_METHODS = {"apt", "pipx", "pip", "go", "cargo", "gem", "npm"}
+_GATED_METHODS = {"git", "script", "docker"}
+_AUDIT = os.path.join(HERE, "tool_install_audit.jsonl")
+
+
+def _audit(entry):
+    """Append-only provenance log: what tool was installed, how, when -- tooling that touched the target."""
+    try:
+        import time
+        entry["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(_AUDIT, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _tool_version(binname):
+    rc, out, err = _kali(f"{binname} --version 2>&1 | head -1 || {binname} -V 2>&1 | head -1", timeout=30)
+    return (out or "").strip()[:120]
+
+
+def install(name, methods=None, approve_gated=None):
+    """Resolve + install one tool (idempotent). Official package managers auto-install; git/script/docker are
+    GATED (need approve_gated=True, or AEGIS_TOOL_AUTO=1). Every attempt is audit-logged with the version."""
+    cat = _load_catalog()
+    spec = cat.get(name, {})
+    binname = spec.get("bin", name)
+    # reject unsafe names for BOTH the tool and its resolved binary (a poisoned catalog bin must not inject)
+    if not _safe_tool(name) or not _safe_tool(binname):
+        print(f"[install] {name}: REJECTED unsafe name"); return {"name": name, "status": "rejected-unsafe-name"}
+    # C2 gate: interactive-C2 frameworks install ONLY when the owner opts in for the contained lab.
+    if spec.get("category") == "c2" and os.environ.get("AEGIS_C2_ENABLE") != "1":
+        print(f"[install] {name}: C2 framework -- opt-in only (set AEGIS_C2_ENABLE=1; authorized contained lab)")
+        _audit({"tool": name, "status": "c2-opt-in-required"})
+        return {"name": name, "status": "c2-opt-in-required"}
+    if have(binname):
+        print(f"[install] {name}: already present ({binname})"); return {"name": name, "status": "present"}
+    if approve_gated is None:
+        approve_gated = os.environ.get("AEGIS_TOOL_AUTO") == "1"
+    plan = methods or spec.get("install") or [("apt", name), ("pipx", name), ("pip", name),
+                                              ("cargo", name), ("gem", name)]
+    skipped_gated = []
+    for method, target in plan:
+        if method in _GATED_METHODS and not approve_gated:
+            print(f"[install] {name}: {method} '{target}' is GATED (arbitrary code) -- skipped; "
+                  f"pass approve_gated=True / AEGIS_TOOL_AUTO=1 to allow.")
+            skipped_gated.append((method, target)); continue
+        print(f"[install] {name}: trying {method} {target} ...", flush=True)
+        ok, note = _try(method, target, binname)
+        landed = have(binname) or method in ("git", "script", "docker")
+        _audit({"tool": name, "bin": binname, "method": method, "target": target,
+                "status": "installed" if (ok and landed) else "attempt-failed",
+                "version": _tool_version(binname) if landed else "", "gated": method in _GATED_METHODS})
+        if ok and landed:
+            print(f"[install] {name}: OK via {method}")
+            return {"name": name, "status": "installed", "method": method, "version": _tool_version(binname)}
+        print(f"[install] {name}: {method} did not land ({note[:120]})")
+    if skipped_gated:
+        return {"name": name, "status": "needs-approval", "gated": skipped_gated}
+    print(f"[install] {name}: FAILED across {[m for m,_ in plan]} -- may need a manual recipe / docker image")
+    _audit({"tool": name, "method": "all", "status": "failed", "tried": [m for m, _ in plan]})
+    return {"name": name, "status": "failed", "tried": [m for m, _ in plan]}
+
+
+def refresh_blackarch():
+    """OPT-IN (AEGIS_TOOLS_ONLINE=1): pull the live BlackArch tool list and merge names into the catalog
+    (name-only entries -> the resolver tries name-based sources). Offline-safe; public data, tooling lane."""
+    if os.environ.get("AEGIS_TOOLS_ONLINE") != "1":
+        print("[refresh] set AEGIS_TOOLS_ONLINE=1 to fetch the BlackArch tool list (public data)."); return
+    rc, out, err = _kali("curl -fsSL https://blackarch.org/tools.html 2>/dev/null | "
+                         "grep -oE '<td>[a-z0-9][a-z0-9._-]+</td>' | sed 's/<[^>]*>//g' | sort -u", timeout=120)
+    names = [n for n in out.splitlines() if n.strip()]
+    if not names:
+        print("[refresh] no names fetched (offline / blocked); catalog unchanged."); return
+    cat = {}
+    if os.path.exists(_CATALOG_PATH):
+        try: cat = json.load(open(_CATALOG_PATH, encoding="utf-8"))
+        except Exception: cat = {}
+    added = 0
+    for n in names:
+        if n not in _SEED and n not in cat:
+            cat[n] = {"bin": n, "distros": ["blackarch"], "category": "blackarch", "install": []}
+            added += 1
+    json.dump(cat, open(_CATALOG_PATH, "w", encoding="utf-8"), indent=1)
+    print(f"[refresh] BlackArch list: {len(names)} tools; added {added} new names to the catalog "
+          f"({_CATALOG_PATH}).")
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Extend Kali with tools missing vs BlackArch/BackBox/Predator-OS")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("check"); sub.add_parser("list"); sub.add_parser("diff"); sub.add_parser("refresh")
+    pi = sub.add_parser("install"); pi.add_argument("name")
+    pi.add_argument("--yes", action="store_true", help="approve GATED installers (git build / curl|bash / docker)")
+    a = ap.parse_args()
+    if a.cmd == "check" or a.cmd == "diff":
+        check()
+    elif a.cmd == "list":
+        cat = _load_catalog()
+        for n, s in sorted(cat.items()):
+            print(f"  {n:18} [{s.get('category','?')}] <- {','.join(s.get('distros',[]))}")
+    elif a.cmd == "install":
+        print(json.dumps(install(a.name, approve_gated=a.yes), indent=2))
+    elif a.cmd == "refresh":
+        refresh_blackarch()
+
+
+if __name__ == "__main__":
+    main()

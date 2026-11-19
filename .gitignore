@@ -1,0 +1,61 @@
+# ── secrets — NEVER commit ───────────────────────────────────────────────
+secret.env
+secret.env.*
+!secret.env.example
+set-env.local.ps1
+!set-env.local.ps1.example
+*.key
+*.pem
+*secret*.bak*
+
+# ── live config (user-provided; fail-closed templates are committed) ──────
+operator/cf_models.json
+operator/cerebras_models.json
+redteam/authorization.json
+redteam/authorization.local.json
+
+# ── run artifacts / findings / scan data (keep the code, not the data) ────
+*findings*.jsonl
+*coverage*.jsonl
+*_audit.jsonl
+*_audit.log
+*.ledger.json
+aegis_operator_ledger.json
+aegis_operator_memory.json
+aegis_operator_findings.jsonl
+operator/campaigns/
+operator/cost_ledger/
+operator/eg_runs/
+operator/ledger_archive/
+operator/mirror_snapshots/
+operator/probe_state/
+operator/recall_benchmarks/
+operator/remediation_fixes*/
+operator/suggestions/
+operator/collective_suggestions/
+operator/zap_seeds/
+operator/*_report.md
+operator/retest_*.jsonl
+exploitgym/eg_results/
+redteam/*_findings.jsonl
+redteam/foothold_audit.jsonl
+board/board_files/
+evidence_store/
+.aegis_chat_session.json
+*.local.json
+
+# ── python / build ───────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# ── editor / os ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

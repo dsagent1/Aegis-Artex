@@ -1,0 +1,80 @@
+{
+  "_doc": "MACHINE-READABLE DOCTRINE for the non-destructive foothold / proof-only C2 (board-converged, board_c2_bridge.md). This is the trust anchor: foothold.py loads it and REFUSES any payload action not on the MAY list or matching a NEVER pattern. A foothold may PROVE + EXPLORE; it must NEVER PERSIST, IMPACT, EXFILTRATE, or EVADE. Edit here, not in code.",
+  "version": 1,
+  "ttl_seconds": 600,
+  "listener": "127.0.0.1",
+  "mirror_only": true,
+  "_mirror_only_note": "mirror_only=true means the foothold/C2 listener is LOOPBACK-ONLY (127.0.0.1) and the proof marker is benign + self-cleaned. It does NOT restrict which AUTHORIZED targets Red-Team may assess: the owner's own online hosts named in redteam/authorization.json are in scope. The C2 channel itself stays contained to the operator box / mirror.",
+  "proof_marker_prefix": "aegis_proof_",
+  "may": {
+    "in_memory_beacon": "ephemeral, process/session-scoped; dies with the session and on TTL expiry; no on-disk agent",
+    "read_only_enumeration": "whoami/hostname/id/uname/ip-addr/route/ps/env-listing etc. -- observe, never alter",
+    "single_proof_marker": "plant ONE uniquely-named benign marker as proof-of-write; removed on teardown (self-cleanup, not target data)",
+    "contained_pivot_channel": "loopback / mirror-only channel for the code_driver to run further READ-ONLY probes from the foothold",
+    "mirror_only_reporting": "report findings only to the contained mirror / local ledger"
+  },
+  "never": {
+    "persist": "no service/scheduled-task/autorun/registry-run/cron/implant that survives reboot, logoff, or session exit",
+    "impact": "no modify/delete/encrypt/overwrite of target data (the ONLY write is the single benign proof marker)",
+    "exfiltrate": "no real data leaves the mirror; no off-box egress",
+    "evade": "no disabling/bypassing/tampering with defenses (AV/EDR/firewall/logging)",
+    "stage": "no dropping secondary stages or downloading code from outside the mirror",
+    "cred_replay_prod": "no using/replaying credentials against production; mirror twin only"
+  },
+  "readonly_commands": [
+    "whoami",
+    "hostname",
+    "id",
+    "uname",
+    "ip",
+    "ifconfig",
+    "route",
+    "netstat",
+    "ss",
+    "ps",
+    "env",
+    "cat",
+    "ls",
+    "pwd",
+    "arp",
+    "getent",
+    "who",
+    "w",
+    "uptime"
+  ],
+  "forbidden_binaries": [
+    "rm",
+    "del",
+    "shred",
+    "mkfs",
+    "dd",
+    "shutdown",
+    "reboot",
+    "systemctl",
+    "sc",
+    "schtasks",
+    "crontab",
+    "at",
+    "reg",
+    "netsh",
+    "iptables",
+    "ufw",
+    "curl",
+    "wget",
+    "scp",
+    "sftp",
+    "nc",
+    "ncat",
+    "socat"
+  ],
+  "oracle": {
+    "gate": "a foothold COUNTS only when it (a) proves host identity AND (b) yields a NEW verified finding (a not-previously-known reachable host, service, or credential). Merely landing earns no credit.",
+    "verify_marks_graph": "attack_graph node is set verified=true ONLY after oracle confirmation"
+  },
+  "teardown": {
+    "guaranteed": true,
+    "removes_proof_marker": true,
+    "snapshot_restore": "primary teardown is mirror_snapshot restore; marker self-cleanup is secondary",
+    "kill_switch_env": "AEGIS_FOOTHOLD=0"
+  }
+}
