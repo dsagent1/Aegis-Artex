@@ -309,6 +309,13 @@ protected files.
 - `operator/code_review.py` — periodic board review of this repo (redacts secrets; advisory).
 - `operator/board_ask.py "<question>"` — ask the panel; watch live with `board/live_board.ps1`.
 
+**Claude is a permanent code-generation / probing seat — via the Claude CLI, not an API key.** The
+`claude` seat in `CODE_SUGGESTERS` (and `board_roster.json`) is backed by `claude -p` headless
+(`operator/code_suggester.py::_claude_cli`): it emits the same `TARGET/CODE/ORACLE` blocks the operator
+runs oracle-verified against the authorized, contained mirror. It skips gracefully when the CLI is absent;
+override the binary with `AEGIS_CLAUDE_CLI` and the timeout with `AEGIS_CLAUDE_CLI_TIMEOUT`. No Anthropic
+API key is required — install the Claude Code CLI and ensure `claude` is on `PATH`.
+
 Connecting providers (Cloudflare / direct / OpenAI-compatible) and the chat: see **§14**.
 
 ---

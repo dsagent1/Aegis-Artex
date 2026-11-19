@@ -92,6 +92,11 @@ AEGIS_MODEL=deepseek-v4-pro
 key to `secret.env` and point the seat's base URL at it (local runtimes like Ollama are keyless, e.g.
 `http://127.0.0.1:11434/v1`).
 
+**D. Claude via the CLI (no API key).** `claude` is a permanent code-generation/probing seat backed by the
+Claude Code CLI (`claude -p`), not an API key — just install the CLI and ensure `claude` is on `PATH`
+(override with `AEGIS_CLAUDE_CLI`). It emits `TARGET/CODE/ORACLE` blocks like any coder seat and skips
+gracefully if the CLI is absent.
+
 Which models sit on the board is set in `operator/board_roster.json`. Full details + diagrams:
 **[docs/ARCHITECTURE.md §14](docs/ARCHITECTURE.md#14-connecting-board-ai-providers--the-chat)**.
 

@@ -80,9 +80,11 @@ _BRAIN_NAMES = {"groq", "gemini", "openrouter", "cerebras"}   # operator-layer O
 # gpt-oss-120b is served via GROQ (free) rather than CF (paid): same weights, $0, and it was the
 # security-coding best-of-3 top scorer. One model, two roles (code writer + board breadth).
 _GPTOSS_GROQ = {"gpt-oss-120b", "gpt-oss", "gpt-oss-120b-groq", "gpt-oss120b"}
+_CLAUDE_NAMES = {"claude", "claude-cli", "claude-code"}   # permanent seat via the Claude CLI (claude -p), not an API key
 
-CODE_SUGGESTERS = ["ds", "gpt-oss-120b", "qwen2.5-coder-32b", "llama-3.3-70b",
-                   "llama-4-scout"]   # gpt-oss-120b now served via Groq (free; was a dup of the 'groq' entry).
+CODE_SUGGESTERS = ["claude", "ds", "gpt-oss-120b", "qwen2.5-coder-32b", "llama-3.3-70b",
+                   "llama-4-scout"]   # 'claude' = PERMANENT seat via the Claude CLI (claude -p), not an API key.
+                   # gpt-oss-120b now served via Groq (free; was a dup of the 'groq' entry).
                    # nemotron-120b DROPPED 2026-10-02 (1/5 on-task + expensive).
                    # TUNED 2026-10-02 from the security-coding best-of-3 (tier_bench --suite security --repeat 3):
                    #   pro 8/8·9/9·9/9, GROQ(gpt-oss-120b, FREE) 7/8·9/9·9/9 -> co-leaders; qwen2.5-coder 7/8·9/9·8/9;
@@ -98,6 +100,8 @@ def suggest(model: str, user: str, max_tokens: int = 1600, temperature: float = 
     The code role is applied to EVERY model (qwen auto-injects it; the rest get it as the system),
     so any CF coder called directly also emits runnable code, not prose."""
     m = model.lower()
+    if m in _CLAUDE_NAMES:
+        return _claude_cli(user, max_tokens, temperature)
     if m in _DS_NAMES:
         return _deepseek(user, max_tokens, temperature)
     if m in _GPTOSS_GROQ:
@@ -108,6 +112,26 @@ def suggest(model: str, user: str, max_tokens: int = 1600, temperature: float = 
     # pass the code role as the system so gpt-oss etc. also produce TARGET/CODE/ORACLE
     return cf_agent.ask(friendly, CODE_FLAVOURED_ROLE, user,
                         max_tokens=max_tokens, temperature=temperature)
+
+
+def _claude_cli(user: str, max_tokens: int = 1600, temperature: float = 0.4) -> str:
+    """PERMANENT board seat backed by the Claude CODE CLI (`claude -p`), NOT an API key. Claude is always a
+    code-generation + probing seat: it emits the same TARGET/CODE/ORACLE blocks the operator runs against the
+    AUTHORIZED, contained mirror (oracle-verified; defensive doctrine governs use). Skips gracefully if the
+    `claude` CLI is not on PATH. Binary override: AEGIS_CLAUDE_CLI; timeout: AEGIS_CLAUDE_CLI_TIMEOUT."""
+    import subprocess, shutil
+    cli = os.environ.get("AEGIS_CLAUDE_CLI", "claude")
+    if not shutil.which(cli):
+        return "[claude CLI unavailable: not on PATH -- install the Claude Code CLI or set AEGIS_CLAUDE_CLI]"
+    prompt = CODE_FLAVOURED_ROLE + "\n\n" + user
+    try:
+        p = subprocess.run([cli, "-p", prompt], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=int(os.environ.get("AEGIS_CLAUDE_CLI_TIMEOUT", "180")))
+    except FileNotFoundError:
+        return "[claude CLI unavailable: not found]"
+    except subprocess.TimeoutExpired:
+        return "[claude CLI timeout]"
+    return (p.stdout or "").strip() or f"[claude CLI empty reply (rc={p.returncode})]"
 
 
 def _brain(name: str, user: str, max_tokens: int, temperature: float) -> str:
