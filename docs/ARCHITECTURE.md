@@ -258,13 +258,28 @@ flowchart LR
 `grade_poe()` is shared by the chain fold and the report fold, so every surface grades a finding
 identically. Reports show `PoE n/4, N ex` per finding.
 
-### 7.4 The oracle family
+### 7.4 The oracle family (33 attack angles)
 
-`HttpOracle` (status+body, SPA/catch-all guard), `AuthzOracle` (cross-role broken-access, FP-resistant),
-`InvariantOracle` / `IdempotencyOracle` / `ResourcePersistenceOracle` (business-logic / money invariants),
-`MassAssignOracle`, `OpenRedirectOracle`, `SessionFixationOracle`, `FileUploadOracle`, `XssOracle`,
-`SsrfOracle`, `CsrfOracle`, `SecurityHeadersOracle`, `RateLimitOracle`, `BruteForceFeasibilityOracle`,
-`UserEnumerationOracle`, … Each returns `(verdict, receipt)` and never raises into the loop.
+Each oracle returns `(verdict, receipt)` and never raises into the loop. Coverage spans many surfaces:
+
+- **Access control / authz:** `AuthzOracle` (cross-role broken-access, FP-resistant), `IdorOracle`,
+  `IdorCrossUserOracle`, `MassAssignOracle`, `AuthStateOracle`, `PinPolicyOracle`.
+- **Injection:** `SqlRawOracle`, `SqlAuthBypassOracle`, `FilterInjectionOracle`, `SstiOracle`,
+  `XssOracle`, command-injection (via vectors) — DB-witness confirmed where possible.
+- **Server-side / request forgery:** `SsrfOracle` (incl. cloud-metadata), `CsrfOracle`,
+  `OpenRedirectOracle`, `CanaryCallbackOracle` (OOB), `FileUploadOracle`.
+- **Session / auth strength:** `SessionFixationOracle`, `JwtForgeryOracle`, `BruteForceFeasibilityOracle`,
+  `UserEnumerationOracle`, `TimingDifferentialOracle`, `RateLimitOracle`.
+- **Business-logic / money invariants:** `InvariantOracle`, `IdempotencyOracle` (replay),
+  `ResourcePersistenceOracle`, `NestedWriteOracle`, `DifferentialOracle`, `FieldLeakOracle`.
+- **Exposure / hygiene:** `SecretsOracle`, `SecurityHeadersOracle`, `HttpOracle` (status+body with
+  SPA/catch-all guard), `DbOracle` (ground-truth DB witness).
+
+Plus 7 **vectors** (web · recon · supply_chain · static · fuzz · misconfig · rag), 8 **discovery legs**
+(ldap · cloud · fingerprint · external · cred_harvest · sbom · honeypot · attackpath), and dedicated angle
+modules (`jwt_forge`, `oob_beacon`, `signal_correlator`, `param_optimizer`, `xss_probe`, `injection`,
+`schema_discovery`, `supply_chain_scan`, `symbolic_reach`, `crawler`, `frontdoor`, `reach`). The ExploitGym
+benchmark exercises these across 9 deliberately-vulnerable targets and 11 scored scenarios.
 
 ---
 
