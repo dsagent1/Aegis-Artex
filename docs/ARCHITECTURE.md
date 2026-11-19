@@ -137,6 +137,13 @@ flowchart LR
 emits anchor `seed_moves`, scores multiple candidate plans, and re-opens the next scenario on a stall.
 Verified wins are written back (closed loop). Kill-switch: `AEGIS_PLANNER=0`.
 
+**CVE × technique fusion + agent extension (`cve_gaps` → `board_synthesize` → `board_extend`).** Beyond
+ranking/novelty, the planner **combines the target's relevant CVE gaps with the technique toolset** into
+*novel composed* approaches (a CVE chained with a technique, two CVEs via a precondition, a primitive reused
+on an uncovered surface), then agents push each **further**. The **environment survey is a hard relevancy
+filter** — `_fuse_moves` drops any proposal not grounded in a fingerprinted surface, so no random/off-target
+tools or CVEs survive. Appropriate tool per stack, or `new-code` when none fits. Env gate: `AEGIS_SYNTH`.
+
 ---
 
 ## 5. The iterative-hunt loop (how the budget is spent)
@@ -280,6 +287,23 @@ Plus 7 **vectors** (web · recon · supply_chain · static · fuzz · misconfig 
 modules (`jwt_forge`, `oob_beacon`, `signal_correlator`, `param_optimizer`, `xss_probe`, `injection`,
 `schema_discovery`, `supply_chain_scan`, `symbolic_reach`, `crawler`, `frontdoor`, `reach`). The ExploitGym
 benchmark exercises these across 9 deliberately-vulnerable targets and 11 scored scenarios.
+
+### 7.5 Assurance: calibrated confidence + reflective self-verification
+
+On top of oracle-verification, two trust layers make findings auditable (tracking the 2025–26 assurance
+direction — MAPTA/JEV-style harnesses):
+
+- **Calibrated confidence + false-positive rate (`grade_confidence`, `FindingStore.assurance`).** Every
+  verified finding carries a **confidence 0..1** from proof depth (PoE), independent confirmations,
+  ground-truth-oracle presence and bound replayable evidence — **downgraded by oracle DISAGREEMENT** (a
+  finding with both a `verified` and a non-`verified` verdict) and by a high reflective FP-risk. `assurance()`
+  reports the **false-positive rate** (`rejected / (verified+rejected)`), inconclusive rate, disagreement
+  count, mean confidence and the low-confidence list — the trust numbers, not just capability.
+- **Reflective self-verification (`operator/reflect.py`, advisory).** A cheap board pass *adversarially
+  argues each verified finding could be a false positive* (SPA/catch-all 200, intended behavior, state
+  artifact, deceptive target, oracle proved the wrong thing), judging only from the finding + receipt + bound
+  evidence. It records `{fp_risk, reasons, recommend}` append-only, **lowers confidence, and flags high-risk
+  findings for review — but never changes status** (the oracle stays ground truth). Env gate: `AEGIS_REFLECT`.
 
 ---
 

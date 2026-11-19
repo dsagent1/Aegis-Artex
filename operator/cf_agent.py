@@ -40,7 +40,19 @@ def _cf_sem():
     return _CF_SEM
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODELS = json.load(open(os.path.join(HERE, "cf_models.json"), encoding="utf-8"))
+def _load_cf_models():
+    """Load the Cloudflare slug map, gracefully: real file, else the shipped .example, else empty.
+    A fresh clone without Cloudflare configured must still import the board stack (installability)."""
+    for name in ("cf_models.json", "cf_models.json.example"):
+        p = os.path.join(HERE, name)
+        if os.path.exists(p):
+            try:
+                d = json.load(open(p, encoding="utf-8"))
+                return {k: v for k, v in d.items() if not str(k).startswith("_")}  # drop _note
+            except Exception:
+                pass
+    return {}
+MODELS = _load_cf_models()
 
 _SECRET_ENV_LOADED = False
 def load_secret_env():

@@ -225,6 +225,26 @@ def grade_poe(status, confirmations, high_conf, traffic_count) -> int:
     return poe
 
 
+def grade_confidence(status, confirmations, high_conf, traffic_count, poe,
+                     disagreement=False, reflect_fp_risk="") -> float:
+    """#2 assurance: a CALIBRATED confidence 0..1 that a VERIFIED finding is a true positive. Combines proof
+    depth (PoE), independent confirmations, ground-truth-oracle presence and bound replayable evidence;
+    DOWNgraded by oracle DISAGREEMENT and a high reflective false-positive risk (#6). Non-verified -> 0.0.
+    Advisory only -- the oracle is still ground truth; this is a trust SIGNAL, not a gate."""
+    if status != "verified":
+        return 0.0
+    c = 0.45 + 0.10 * min(int(poe or 0), 4)              # 0.45..0.85 from proof depth
+    if high_conf:
+        c += 0.10                                        # a ground-truth oracle confirmed it
+    c += 0.05 * max(0, (confirmations or 1) - 1)         # each extra INDEPENDENT oracle
+    if (traffic_count or 0) >= 1:
+        c += 0.05                                        # a replayable proof exchange is bound
+    if disagreement:
+        c -= 0.25                                        # oracles disagreed on this finding
+    c -= {"high": 0.30, "medium": 0.15}.get((reflect_fp_risk or "").lower(), 0.0)   # #6 reflection
+    return round(max(0.0, min(1.0, c)), 3)
+
+
 def dedup_findings(findings):
     """Collapse duplicate / synthetic-variant findings sharing the same (claim-family, surface, class) --
     e.g. a synthetic concurrency variant of the same resource-persistence bug on the same surface -- keeping
@@ -378,6 +398,13 @@ class FindingStore:
         rt = {"verdict": verdict, "receipt": dict(receipt or {}), "ts": _now()}
         self._append({"type": "retest", "finding_id": finding_id, "retest": rt})
 
+    def record_reflection(self, finding_id: str, reflection: dict) -> None:
+        """#6: attach a reflective self-verification verdict (adversarial 'why this is a false positive')
+        to a finding, append-only. ADVISORY -- it never changes status/evidence (the oracle is ground
+        truth); it lowers the finding's confidence and flags it for review. {fp_risk, reasons, recommend}."""
+        rf = dict(reflection or {}); rf.setdefault("ts", _now())
+        self._append({"type": "reflection", "finding_id": finding_id, "reflection": rf})
+
     def events(self) -> list:
         out = []
         if not os.path.exists(self.path): return out
@@ -404,6 +431,7 @@ class FindingStore:
         state: dict = {}
         confirms: dict = {}   # A1: fid -> set of DISTINCT oracle_ids that produced a 'verified' transition
         ev_by_fid: dict = {}  # ARTEX-port A1: fid -> accumulated bound evidence across ALL transitions
+        verdicts: dict = {}   # #2 assurance: fid -> {oracle_id: status} across ALL transitions (disagreement)
         for e in self.events():
             if e["type"] == "record":
                 fd = e["finding"]; state[fd["finding_id"]] = fd
@@ -415,6 +443,7 @@ class FindingStore:
                     state[fid]["oracle_receipt"] = e["oracle_receipt"]
                     if e["status"] == "verified" and e.get("oracle_id"):
                         confirms.setdefault(fid, set()).add(e["oracle_id"])
+                    verdicts.setdefault(fid, {})[e.get("oracle_id") or "?"] = e["status"]   # #2
                     # a later transition overwrites oracle_receipt, so accumulate its evidence separately
                     _rev = (e.get("oracle_receipt") or {}).get("evidence") or []
                     if _rev:
@@ -428,6 +457,11 @@ class FindingStore:
                 if fid in state:
                     state[fid].setdefault("retests", []).append(e["retest"])
                     state[fid]["retest"] = e["retest"]       # latest verdict wins
+            elif e["type"] == "reflection":                  # #6 reflective self-verification
+                fid = e["finding_id"]
+                if fid in state:
+                    state[fid].setdefault("reflections", []).append(e["reflection"])
+                    state[fid]["reflection"] = e["reflection"]  # latest reflection wins
         # A1 (doctrine) + X gate-fix: a HIGH/critical needs >=2 INDEPENDENT oracle confirmations -- UNLESS a
         # single confirming oracle is HIGH-CONFIDENCE deterministic ground truth (a canary/OOB callback, a DB
         # witness, an OOB-SSRF, or a DB-confirmed raw-SQL/filter-injection), which is sufficient alone. A
@@ -459,7 +493,36 @@ class FindingStore:
             tc = len(dedup)
             f["traffic_count"] = tc
             f["poe"] = grade_poe(f.get("status"), n, hi_conf, tc)
+            # #2 assurance: oracle DISAGREEMENT (verified AND a non-verified verdict on the same finding) +
+            # a CALIBRATED confidence (downgraded by disagreement and a high reflective FP-risk from #6).
+            _vd = verdicts.get(fid, {})
+            _st = set(_vd.values())
+            f["disagreement"] = ("verified" in _st and bool(_st - {"verified"}))
+            f["verdict_spread"] = _vd
+            f["confidence"] = grade_confidence(f.get("status"), n, hi_conf, tc, f["poe"],
+                                               f["disagreement"], (f.get("reflection") or {}).get("fp_risk", ""))
         return state
+
+    def assurance(self) -> dict:
+        """#2 assurance metrics over the store: verification-outcome rates + confidence + disagreement.
+        false_positive_rate = rejected / (verified + rejected) -- the trust number ATO/JEV-style harnesses
+        track (how often a CANDIDATE was an over-claim the oracle refuted). Advisory report metric."""
+        fs = list(self.findings().values())
+        ver = [f for f in fs if f.get("status") == "verified"]
+        rej = [f for f in fs if f.get("status") == "rejected"]
+        inc = [f for f in fs if f.get("status") == "inconclusive"]
+        confs = [f.get("confidence", 0.0) for f in ver]
+        denom = len(ver) + len(rej)
+        buckets = {"high(>=0.8)": 0, "med(0.5-0.8)": 0, "low(<0.5)": 0}
+        for c in confs:
+            buckets["high(>=0.8)" if c >= 0.8 else "med(0.5-0.8)" if c >= 0.5 else "low(<0.5)"] += 1
+        return {"total": len(fs), "verified": len(ver), "rejected": len(rej), "inconclusive": len(inc),
+                "false_positive_rate": round(len(rej) / denom, 3) if denom else None,
+                "inconclusive_rate": round(len(inc) / len(fs), 3) if fs else None,
+                "disagreements": sum(1 for f in fs if f.get("disagreement")),
+                "mean_confidence": round(sum(confs) / len(confs), 3) if confs else None,
+                "confidence_distribution": buckets,
+                "low_confidence_verified": [f.get("finding_id") for f in ver if f.get("confidence", 0) < 0.5]}
 
     def verified(self) -> list:
         return [f for f in self.findings().values() if f["status"] == "verified"]

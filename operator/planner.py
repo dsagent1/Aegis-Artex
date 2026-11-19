@@ -341,6 +341,124 @@ class Planner:
             })
         return moves
 
+    # ---- CVE x technique FUSION + agent EXTENSION (relevancy-filtered: appropriate tooling only) ----
+    def _rag_cve(self, terms: str, limit: int = 8) -> list:
+        """Best-effort offline CVE-RAG query (shelled into the RAG home). Returns [] if unavailable."""
+        cmd = f"cd {self.rag_home} && python3 rag_query.py --json --k {int(limit)} {json.dumps(terms)}"
+        try:
+            p = subprocess.run(_shell_argv(self.distro, cmd), capture_output=True, text=True, timeout=60)
+            out = (p.stdout or "").strip(); i = out.find("[")
+            return json.loads(out[i:]) if i >= 0 else []
+        except Exception:
+            return []
+
+    def cve_gaps(self, fp: dict, limit: int = 8) -> list:
+        """The target's RELEVANT CVE gaps -- matched to the FINGERPRINTED stack ONLY (the survey IS the
+        filter, so an unrelated CVE never appears). Sources: known_vulns already on the fingerprint, plus a
+        best-effort offline CVE-RAG query keyed on the stack terms. Flags KEV / high-EPSS / exploit-available.
+        Returns [] if the RAG is unavailable -- never fatal."""
+        try:
+            lim = int(os.environ.get("AEGIS_SYNTH_CVE_LIMIT", str(limit)))
+        except Exception:
+            lim = limit
+        gaps, seen = [], set()
+        def _add(cve, comp, kev, epss, exploit, note):
+            cve = (cve or "").strip()
+            if cve and cve not in seen:
+                seen.add(cve)
+                gaps.append({"cve": cve, "component": comp or "", "kev": bool(kev), "epss": epss,
+                             "has_exploit": bool(exploit), "note": (note or "")[:120]})
+        for kv in (fp.get("known_vulns") or []):
+            if isinstance(kv, dict):
+                _add(kv.get("cve") or kv.get("id"), kv.get("component"), kv.get("kev"), kv.get("epss"),
+                     kv.get("exploit") or kv.get("edb") or kv.get("msf"), kv.get("note") or kv.get("desc"))
+        if len(gaps) < lim:
+            terms = fp.get("terms") or " ".join(fp.get("stack") or []) or " ".join((fp.get("surfaces") or [])[:3])
+            for r in (self._rag_cve(terms, lim) if terms else []):
+                if isinstance(r, dict):
+                    _add(r.get("cve") or r.get("id"), r.get("component") or r.get("cpe"),
+                         r.get("kev"), r.get("epss"), r.get("exploitdb") or r.get("msf") or r.get("nuclei"),
+                         r.get("desc") or r.get("summary") or r.get("text"))
+        return gaps[:lim]
+
+    def board_synthesize(self, fp: dict, known_ids: list, cve_gaps: list, n: int = 4) -> list:
+        """FUSION: COMBINE the target's RELEVANT CVE gaps with the known technique toolset into NOVEL
+        COMPOSED approaches for THIS environment. The fingerprint is a HARD FILTER -- only approaches
+        grounded in a fingerprinted surface/component with APPROPRIATE tooling (no random tools/CVEs/code).
+        Returns anchor seed_moves (tag planner:synth). No-op without env-matched CVE gaps."""
+        if not cve_gaps:
+            return []
+        sysp = ("You are the Planner's FUSION strategist on an AUTHORIZED, contained assessment. COMBINE the "
+                "target's PRESENT CVE gaps with the known techniques into up to %d NOVEL COMPOSED approaches. "
+                "HARD RULES: (1) RELEVANCE -- use ONLY CVEs/tools/techniques that APPLY to THIS environment "
+                "(the fingerprint is the filter); never propose a tool/CVE/code for a component or platform "
+                "NOT present. (2) Each approach must be a COMBINATION: a CVE chained with a technique, two "
+                "CVEs bridged by a precondition, or a technique primitive reused on an uncovered surface. "
+                "(3) Pick the APPROPRIATE tool for the stack, or 'new-code' only when no existing tool fits "
+                "-- no random tool waste. Output ONLY a JSON array: [{\"approach\":\"short name\",\"combines\":"
+                "[\"CVE-.. or technique-id\",\"..\"],\"vuln_class\":\"..\",\"surface\":\"/.. (a fingerprinted "
+                "surface)\",\"mechanism\":\"how the combination works\",\"tool_or_code\":\"an applicable tool "
+                "OR 'new-code: <what>'\",\"expected_oracle\":\"the observable that proves it\",\"why\":\"why "
+                "this combination fits THIS target\"}]. No prose, no fenced block." % int(n))
+        raw = self._board(sysp, json.dumps({"environment": fp, "known_techniques": known_ids,
+                                            "cve_gaps": cve_gaps})[:7000])
+        return self._fuse_moves(raw, fp, "planner:synth", "board-synth")
+
+    def board_extend(self, fp: dict, proposals: list, n: int = 3) -> list:
+        """AGENT EXTENSION: push each composed/novel proposal FURTHER -- add a chaining hop, a deeper oracle,
+        or a scoped NON-DESTRUCTIVE variant a real attacker would try next -- STILL relevancy-filtered to THIS
+        environment. Returns extra anchor seed_moves (tag planner:extend)."""
+        if not proposals:
+            return []
+        brief = [{"approach": m.get("technique") or m.get("why_novel"), "surface": m.get("surface"),
+                  "vuln_class": m.get("vuln_class"), "mechanism": m.get("mechanism")} for m in proposals[:6]]
+        sysp = ("You are the Planner's EXTENSION strategist on an AUTHORIZED, contained assessment. Take each "
+                "PROPOSAL and push it FURTHER into up to %d stronger follow-ons: a chaining hop, a deeper "
+                "oracle, or a scoped NON-DESTRUCTIVE variant. HARD RULE: stay RELEVANT to THIS environment -- "
+                "only surfaces/tools that apply here, no random additions. Output ONLY a JSON array with the "
+                "same fields as a fusion approach (approach, combines, vuln_class, surface (fingerprinted), "
+                "mechanism, tool_or_code, expected_oracle, why). No prose, no fenced block." % int(n))
+        raw = self._board(sysp, json.dumps({"environment": fp, "proposals": brief})[:7000])
+        return self._fuse_moves(raw, fp, "planner:extend", "board-extend")
+
+    def _fuse_moves(self, raw: str, fp: dict, seed: str, why_prefix: str) -> list:
+        """Parse a fusion/extension reply into anchor moves + apply the deterministic RELEVANCY FILTER: drop
+        any proposal whose surface is not grounded in the fingerprint (so no random/off-target moves survive
+        even if the model proposes one). If no surface map exists yet, the prompt-level filter still binds."""
+        try:
+            i, j = raw.find("["), raw.rfind("]")
+            arr = json.loads(raw[i:j + 1]) if i >= 0 and j > i else []
+        except Exception:
+            arr = []
+        fp_surfaces = {str(s).rstrip("/").lower() for s in
+                       ((fp.get("surfaces") or []) + (fp.get("crawled_surfaces") or [])) if s}
+        roles = fp.get("roles") or ["owner"]
+        moves = []
+        for k, m in enumerate(arr):
+            if not isinstance(m, dict):
+                continue
+            surface = (m.get("surface") or "/").strip()
+            s_norm = surface.rstrip("/").lower()
+            if fp_surfaces and not (s_norm in fp_surfaces
+                                    or any(s_norm.startswith(s) or s.startswith(s_norm) for s in fp_surfaces)):
+                continue   # RELEVANCY FILTER: off-survey surface -> dropped (no random tool/target waste)
+            cls = (m.get("vuln_class") or "novel").lower().strip()
+            toc = str(m.get("tool_or_code") or "")
+            is_code = toc.lower().startswith("new-code")
+            moves.append({
+                "action": _class_to_action(cls),
+                "surface": surface, "path": surface if _class_to_action(cls) == "web" else None,
+                "vuln_class": cls, "mechanism": (m.get("mechanism", "") or "")[:80],
+                "technique": seed.split(":")[1] + ":" + (m.get("approach") or f"x{k}").lower().replace(" ", "-")[:32],
+                "tool": ("" if is_code else toc), "new_code": ([toc] if is_code else []),
+                "role": roles[k % len(roles)], "trust": roles[k % len(roles)],
+                "combines": m.get("combines") or [],
+                "expected_oracle": m.get("expected_oracle", "confirm the observable"),
+                "why_novel": why_prefix + ": " + (m.get("why") or m.get("approach") or "composed approach")[:100],
+                "seed": seed,
+            })
+        return moves
+
     def seed_moves(self, ranked: list, base: str, roles=None, mode: str = "operator") -> list:
         """Turn ranked techniques into MODE-1 anchor moves for iterative_hunt (one per technique)."""
         roles = roles or ["owner"]
@@ -739,6 +857,14 @@ class Planner:
              'why_novel':'inject privileged fields into an invoice create (mass assignment)'}])
         import copy as _copy
         plans = []
+        # CVE x technique FUSION + agent extension, computed ONCE (relevancy-filtered; appropriate tooling
+        # only; bounded to one synth + one extend board call). Env-gated AEGIS_SYNTH; no-op without env CVEs.
+        _synth = []
+        if board and os.environ.get("AEGIS_SYNTH", "1") != "0":
+            _gaps = self.cve_gaps(fp)
+            if _gaps:
+                _sm = self.board_synthesize(fp, known_ids, _gaps, n=4)
+                _synth = _sm + self.board_extend(fp, _sm, n=2)
         for prof in _SCENARIOS[:max(1, n_scenarios)]:
             ordered = self._emphasis_sort(relevant, prof["emphasis"])
             seeds = (disco_seeds + _copy.deepcopy(zap_seed) + _copy.deepcopy(sc_seeds) + _copy.deepcopy(bo_seeds) + _copy.deepcopy(bg_seeds) + _copy.deepcopy(fd_seeds) + _copy.deepcopy(in_seeds) + _copy.deepcopy(st_seeds) + _copy.deepcopy(sy_seeds)
@@ -747,7 +873,7 @@ class Planner:
                      + _copy.deepcopy(cs_seeds) + _copy.deepcopy(ss_seeds) + _copy.deepcopy(xss_seeds)
                      + _copy.deepcopy(up_seeds)
                      + self.seed_moves(ordered, base or target, roles=roles))
-            nmoves = self.board_novel(fp, known_ids, n=prof["novel"]) if (board and prof["novel"]) else []
+            nmoves = (self.board_novel(fp, known_ids, n=prof["novel"]) if (board and prof["novel"]) else []) + _copy.deepcopy(_synth)
             for m in seeds + nmoves:                      # tag scenario for the audit/report
                 m["scenario"] = prof["name"]
             emphasis_hit = sum(1 for t in ordered

@@ -141,12 +141,13 @@ def _fold_ledger(path):
     transition lines by finding_id (last transition wins). Tolerates a partially-written last line."""
     import json as _j, ast, re as _re
     try:
-        from verified_findings import grade_poe, high_confidence_oracle   # ARTEX-port B2 (shared grader)
+        from verified_findings import grade_poe, high_confidence_oracle, grade_confidence  # B2 + #2 graders
     except Exception:
-        grade_poe = high_confidence_oracle = None
+        grade_poe = high_confidence_oracle = grade_confidence = None
     recs = {}
     ev_by_fid = {}   # fid -> accumulated bound evidence (finding's own + every transition receipt's)
     confirms = {}    # fid -> set of DISTINCT oracle_ids that produced a 'verified' transition
+    verdicts = {}    # #2: fid -> {oracle_id: status} across transitions (disagreement)
     try:
         lines = open(path, encoding="utf-8").read().splitlines()
     except Exception:
@@ -198,7 +199,12 @@ def _fold_ledger(path):
                     ev_by_fid.setdefault(fid, []).append(_ev)
                 if row.get("status") == "verified" and row.get("oracle_id"):
                     confirms.setdefault(fid, set()).add(row.get("oracle_id"))
-    # ARTEX-port B2: grade proof strength (PoE 0-4) + count distinct bound replayable exchanges per finding.
+                verdicts.setdefault(fid, {})[row.get("oracle_id") or "?"] = row.get("status")   # #2
+        elif t == "reflection":                             # #6 reflective self-verification
+            fid = row.get("finding_id")
+            if fid:
+                recs.setdefault(fid, {})["reflection"] = row.get("reflection")
+    # ARTEX-port B2 + #2: grade proof strength (PoE) + bound-exchange count + disagreement + confidence.
     for fid, rec in recs.items():
         shas = {e.get("artifact_sha256") for e in ev_by_fid.get(fid, [])
                 if isinstance(e, dict) and e.get("kind") == "http" and e.get("artifact_sha256")}
@@ -206,6 +212,11 @@ def _fold_ledger(path):
         if grade_poe:
             oids = confirms.get(fid, set())
             rec["poe"] = grade_poe(rec.get("status"), len(oids), high_confidence_oracle(oids), len(shas))
+            _st = set(verdicts.get(fid, {}).values())
+            rec["disagreement"] = ("verified" in _st and bool(_st - {"verified"}))
+            rec["confidence"] = grade_confidence(rec.get("status"), len(oids), high_confidence_oracle(oids),
+                                                 len(shas), rec.get("poe", 0), rec["disagreement"],
+                                                 (rec.get("reflection") or {}).get("fp_risk", ""))
     return list(recs.values())
 
 
