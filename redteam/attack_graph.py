@@ -12,6 +12,8 @@ Pure + dependency-free; unit-testable without a live directory.
 """
 from __future__ import annotations
 
+import os
+import json
 from collections import defaultdict, deque
 
 # edges that represent an attacker-usable step, with a rough "cost" (lower = easier/cheaper)
@@ -72,6 +74,79 @@ class AttackGraph:
         for i, (rel, c) in enumerate(path["edges"]):
             segs.append(f"{path['nodes'][i]} --{rel}--> {path['nodes'][i+1]}")
         return " ; ".join(segs) + f"  (hops={len(path['edges'])}, cost={path['cost']})"
+
+    # ---- #5: PERSISTENCE -- the graph accumulates across runs so the planner searches an ever-richer
+    # map instead of starting blind each run. Plain JSON (no deps); edges are deduped on merge/load. ----
+    def to_dict(self) -> dict:
+        return {"nodes": self.nodes,
+                "edges": {s: [list(e) for e in es] for s, es in self.edges.items() if es}}
+
+    def save(self, path: str = None) -> str:
+        path = path or default_graph_path()
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2, sort_keys=True)
+        os.replace(tmp, path)                      # atomic -- never leaves a half-written graph
+        return path
+
+    def _add_edge_unique(self, src, dst, relation, cost):
+        for d, r, _c in self.edges.get(src, []):
+            if d == dst and r == relation:
+                return                             # dedup: same (dst, relation) already present
+        self.edges[src].append((dst, relation, cost if cost is not None else STEP_COSTS.get(relation, 2)))
+
+    def merge(self, other: "AttackGraph") -> "AttackGraph":
+        """Union another graph into this one (nodes + deduped edges). Returns self so runs can chain:
+        g = AttackGraph.load(); g.merge(from_findings(verified)); g.save()."""
+        for nid, props in other.nodes.items():
+            self.nodes.setdefault(nid, {}).update(props)
+        for src, es in other.edges.items():
+            self.nodes.setdefault(src, {"type": "unknown"})
+            for dst, rel, c in es:
+                self.nodes.setdefault(dst, {"type": "unknown"})
+                self._add_edge_unique(src, dst, rel, c)
+        return self
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AttackGraph":
+        g = cls()
+        for nid, props in (d.get("nodes") or {}).items():
+            p = dict(props or {}); g.nodes[nid] = {"type": p.pop("type", "unknown"), **p}
+        for src, es in (d.get("edges") or {}).items():
+            for e in es:
+                dst, rel = e[0], e[1]
+                c = e[2] if len(e) > 2 else None
+                g._add_edge_unique(src, dst, rel, c)
+        return g
+
+    @classmethod
+    def load(cls, path: str = None) -> "AttackGraph":
+        """Load the persistent graph (empty graph if none exists yet -- never raises on a fresh box)."""
+        path = path or default_graph_path()
+        if not os.path.exists(path):
+            return cls()
+        try:
+            with open(path, encoding="utf-8") as f:
+                return cls.from_dict(json.load(f))
+        except Exception:
+            return cls()                           # a corrupt store never blocks a run
+
+
+def default_graph_path() -> str:
+    """Where the persistent attack graph lives. Override with AEGIS_ATTACK_GRAPH; data, so gitignored."""
+    return os.environ.get("AEGIS_ATTACK_GRAPH") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "attack_graph.json")
+
+
+def persist_from_findings(findings, path: str = None) -> "AttackGraph":
+    """#5 one-call accumulation step: load the persistent graph, merge in this run's verified findings,
+    save, and return it. Safe + additive -- a post-run hook can call this without touching the loop's
+    control flow, and the planner then searches the ever-richer accumulated map next run."""
+    g = AttackGraph.load(path)
+    g.merge(from_findings(findings))
+    g.save(path)
+    return g
 
 
 def from_findings(findings):

@@ -144,6 +144,21 @@ on an uncovered surface), then agents push each **further**. The **environment s
 filter** — `_fuse_moves` drops any proposal not grounded in a fingerprinted surface, so no random/off-target
 tools or CVEs survive. Appropriate tool per stack, or `new-code` when none fits. Env gate: `AEGIS_SYNTH`.
 
+**Classical planning + persistent attack graph (`redteam/planning.py` + `redteam/attack_graph.py`).** On top
+of the brainstorm sits a STRIPS/PDDL-style **classical planner**: grounded actions carry
+preconditions / add-effects / delete-effects / cost, and an **A\* search** (admissible unmet-goal-count
+heuristic) returns a *least-cost* action chain from the initial facts to a goal state — or an honest **NO
+PLAN** when the goal is unreachable with what is currently known. Actions are grounded in the **same ground
+truth** the loop holds: `operators_from_graph` turns each attacker-usable attack-graph edge into an action,
+and `operators_from_techniques` turns technique-DB entries (with `requires`/`grants`/`consumes`) into
+actions, so credential and technique **preconditions compose in one search** (e.g. `phish → cred → use_cred →
+at(host) → privesc → owns(host)`). This is cost-optimal where the graph's hop-first `best_path` is not. The
+attack graph is now **persistent** (`save`/`load`/`merge`, atomic JSON at `AEGIS_ATTACK_GRAPH`): a post-run
+hook (`persist_from_findings`) merges each run's verified findings into the accumulated map, so next run the
+planner searches an ever-richer graph — paths no single run could see become reachable once the map is
+unioned. The plan's first steps surface as MODE-1 anchor `seed_moves` (`seed_moves_from_plan`), so the plan
+actually steers early execution. Self-tests: `redteam/_planning_tests.py` (16/16).
+
 ---
 
 ## 5. The iterative-hunt loop (how the budget is spent)

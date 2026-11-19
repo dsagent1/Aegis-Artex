@@ -59,3 +59,6 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# #5: generated persistent attack graph (run data, never committed)
+redteam/attack_graph.json
