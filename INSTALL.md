@@ -105,9 +105,16 @@ The platform is **contained-by-default** — assess the mirror, not production.
 
 ## 6. Run it
 ```bash
-# interactive co-pilot chat (planner + drivers + execution, human-in-the-loop)
-python operator/aegis_operator.py --chat --provider deepseek
-#   --session <file>  save/continue ;  --model <name>  switch brain ;  tools: retest_finding, remediation
+# STANDBY co-pilot chat (planner + drivers + execution, human-in-the-loop, context kept across turns)
+./ds-standby.ps1                                  # Windows one-liner: --chat, safe mode, no target
+./ds-standby.ps1 -Session ./ds.json -Resume       # save/continue a session
+python operator/aegis_operator.py --chat --provider deepseek    # any OS
+#   switch the driving agent live, mid-chat (keeps context):
+#     /ds /kimi /qwen /scout /llama /cerebras /openrouter   (+ /<brain>-think, /think, /nothink, /next)
+#   /session save, /resume, /compact, /stop ;  tools: retest_finding, remediation, ...
+
+# ask the multi-model BOARD (answers on the blackboard; watch with board/live_board.ps1)
+python operator/board_ask.py "which surface should we prioritise next?" --panel ds,coders
 
 # one-shot task
 python operator/aegis_operator.py --task "assess the authorized mirror at $AEGIS_TARGET" \

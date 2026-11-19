@@ -447,20 +447,51 @@ OpenRouter, Together, Groq, Ollama, vLLM — anything speaking the OpenAI Chat C
 > `message.content` as a dict/list — normalize to text (see `code_review.py::_as_text`). Board chat can use
 > a cheaper/faster model while the executor brain stays on the benchmarked model.
 
-### The chat (interactive + standby)
-```bash
-# interactive co-pilot chat (the human channel to the operator)
-python operator/aegis_operator.py --chat --provider deepseek
-#   --session <file>   save/continue a conversation (auto-resumed)
-#   --model <name>     switch brain; live switch in --chat with /ds, /kimi, ...
-#   tools include retest_finding, remediation, ... ; /stop ends the task
+### The chat / standby (interactive co-pilot)
+The operator runs as an interactive **standby** co-pilot: DeepSeek (or any configured brain) sits in the
+seat with all tools loaded and context kept across turns; you drive it at a prompt exactly like a task, and
+name the target when ready. Approval mode is `ask | safe | auto`.
 
-# one-shot task
-python operator/aegis_operator.py --task "assess the authorized mirror at $AEGIS_TARGET" \
-  --target-mode mirror --max-iter 40
+```bash
+# one-liner standby launcher (Windows PowerShell) — brings the co-pilot up in --chat
+./ds-standby.ps1                          # standby, no target, safe mode (auto read-only, prompt on the rest)
+./ds-standby.ps1 -Target https://localhost:8443 -TargetMode mirror
+./ds-standby.ps1 -Mode ask                # prompt on every action   (-AutoApprove = -Mode auto)
+./ds-standby.ps1 -Session ./ds.json -Resume   # save/continue a session (/resume works live too)
+
+# or directly, any OS
+python operator/aegis_operator.py --chat --provider deepseek
+python operator/aegis_operator.py --task "assess the authorized mirror at $AEGIS_TARGET" --target-mode mirror --max-iter 40
 ```
-Both `--chat` and `--task` run through the **same** tool-loop, so every tool (including `retest_finding`
-and `remediation`) and the untrusted-output boundary apply identically in standby.
+
+**Switch the driving agent on the fly** — mid-chat, change the brain without losing context. From
+`_BRAIN_CMDS` (single source of truth, so the banner never drifts):
+
+| Command | Brain | `-think` variant |
+|---|---|---|
+| `/ds` (`/deepseek`) | DeepSeek | `/ds-think` |
+| `/kimi` (`/k2`) · `/kimi-code` | Kimi (Cloudflare) | `/kimi-think` |
+| `/qwen` (`/qw`) | Qwen2.5-Coder (Cloudflare) | `/qwen-think` |
+| `/scout` (`/llama4`) · `/llama` (`/l`) | Llama-4-Scout / Llama-3.3 | `/scout-think` |
+| `/cerebras` (`/cb`) · `/openrouter` (`/or`) | Cerebras / any OpenRouter model | — |
+| `/claude` | Claude seat (if configured) | — |
+| `/next` | cycle to the next brain | — |
+| `/think` `/reason` · `/nothink` `/fast` | toggle reasoning for the **current** brain | — |
+
+Other in-chat commands: `/session` save/`/resume`, `/compact` (fold history), `/stop` (end the task
+cleanly). `--chat` and `--task` share the **same** tool-loop, so every tool (`retest_finding`,
+`remediation`, …) and the untrusted-output boundary apply identically in standby.
+
+### The board chat (ask the panel, watch it live)
+The multi-model **board** is a file-based blackboard the human can query through the operator:
+```bash
+python operator/board_ask.py "which surface should we prioritise next: the auth flow or the payment path?"
+python operator/board_ask.py "..." --panel ds,coders      # limit who answers (ds + the coder bench)
+board/live_board.ps1                                       # watch the board update live (~25s refresh)
+```
+The panel answers on the board (consolidated, with named dissent); the operator — the single executing
+seat — decides and verifies. `operator/cf_agent.py` adds Cloudflare seats; `operator/board_discuss.py` /
+`board_feedback.py` drive multi-round board discussion.
 
 ---
 

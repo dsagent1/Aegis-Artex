@@ -15,7 +15,7 @@ distinct-lineage second opinion.
 CONSULTANTS (their opinion), not as code writers. Narrow it with --panel when you want fewer voices.
 
 Usage:
-    python board_ask.py "should we prioritise the estimate->invoice copy path or the QB webhook next?"
+    python board_ask.py "which surface should we prioritise next: the auth flow or the payment path?"
     python board_ask.py "..." --no-panel          # just post the question to the board
     python board_ask.py "..." --panel ds,sol       # limit which panel members answer
     python board_ask.py "..." --panel ds,coders    # ds + the strong coder bench only

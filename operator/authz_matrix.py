@@ -35,7 +35,7 @@ for _p in (HERE, os.path.join(HERE, "..", "shared")):
 DEFAULT_ROUTES = [
     "/api/settings", "/api/payroll", "/api/audit-logs", "/api/invoices", "/api/expenses",
     "/api/users", "/api/credit-notes", "/api/payments", "/api/customers", "/api/jobs",
-    "/api/estimates", "/api/reports", "/api/quickbooks", "/api/suppliers", "/api/technicians",
+    "/api/estimates", "/api/reports", "/api/accounting", "/api/suppliers", "/api/technicians",
 ]
 
 
