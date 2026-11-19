@@ -60,6 +60,26 @@ export AEGIS_KALI_DISTRO=kali-linux     # or your Arch WSL distro / "" for a nat
 ```
 On a native Linux host (not WSL), the drivers run `bash -lc` locally — no `wsl.exe` needed.
 
+### The toolbox — Kali, Arch, or any Linux; tools on demand
+Aegis-Artex is **not tied to Kali**. The toolset host can be **Kali**, **Arch Linux**, or **any Linux**
+(WSL, VM, container, or bare metal) — the `kali_driver` just runs shell in whatever distro
+`AEGIS_KALI_DISTRO` names (`""` = the local host). Install only what your assessments use; **nothing is
+bundled**.
+
+**If a tool isn't present, agents install it on demand.** The operator/board detect a missing tool from the
+command error and bring it in via the host's package manager or language toolchain, then retry — for example:
+
+| Host | Install on demand |
+|---|---|
+| Kali / Debian | `apt-get install -y <tool>` (nmap, nikto, whatweb, ffuf, sqlmap, …) |
+| Arch | `pacman -S --needed <tool>` or an AUR helper |
+| Go-based tools | `go install github.com/projectdiscovery/<tool>/...@latest` (nuclei, httpx, katana) |
+| Python tools | `pipx install <tool>` / `pip install <tool>` |
+| Fuzzing engines | libFuzzer (clang), `apt/pacman install afl++ honggfuzz`, `pip install atheris`, Jazzer.js via npm |
+
+Keep installs inside the contained toolset host. The mirror/twin and its scanners live here too, so the
+agent, the tools, and the target all share one reachable network.
+
 ## 3. Bring up the executors
 ```powershell
 ./start-all.ps1        # starts kali_driver (8901) + browser_use (8902) + bridge (8765)
