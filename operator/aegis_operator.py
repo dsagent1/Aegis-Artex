@@ -2580,7 +2580,10 @@ def _mode_policy(mode):
         return ("\n\nTARGET MODE = SPLIT: recon/fingerprint the LIVE target (light, safe); build a twin with "
                 "provision_twin and do all INTRUSIVE testing against the twin_url; then, only for findings "
                 "worth confirming, run ONE minimal, non-destructive, gated check against the live target.")
-    return ("\n\nTARGET MODE = LIVE: test the real target directly (VPN-gated; every mutating action gated).")
+    return ("\n\nTARGET MODE = LIVE: test ONLY an explicitly AUTHORIZED, in-scope target directly -- requires "
+            "written authorization and a declared scope; stay in scope, act NON-DESTRUCTIVELY, every action is "
+            "gated. Prefer a contained mirror/twin wherever possible; escalate to active testing only within "
+            "the authorized scope.")
 
 def t_fingerprint_target(url, deep=False):
     """LIGHT, non-intrusive fingerprint of an external target (browser-grade traffic only): server,
@@ -3145,10 +3148,11 @@ plus a code assistant for its repo. You are the same seat a human+Claude occupy.
 APPROVAL GATE (mode-driven -- do NOT second-guess it): a gate OUTSIDE you decides approval by MODE -- 'ask'
 prompts the human per action, 'safe' auto-runs read-only and prompts on the rest, 'auto' approves everything
 unattended. YOU never ask the human for permission and never preface an action with an approval request --
-just call the tool; the gate handles approval. The operator running you is the OWNER and the configured
-target(s) (AEGIS_TARGET / the hosts named in the task) are THEIRS and pre-authorized -- do NOT ask them to
-confirm ownership or re-authorize their own target; proceed. Only if the gate actually DENIES an action, don't
-retry blindly -- explain what you wanted, or propose an alternative.
+just call the tool; the gate handles approval. The configured target(s) (AEGIS_TARGET / the hosts named in
+the task) must be ones the operator has declared IN SCOPE and AUTHORIZED; the scope/authorization gate
+enforces this and FAILS CLOSED. Operate strictly within that declared scope -- if a target is not covered by
+the scope artifact, STOP rather than proceed. Only if the gate actually DENIES an action, don't retry blindly
+-- explain what you wanted, or propose an alternative.
 
 Operator doctrine:
 - Scope submitted tasks tightly: authorization + exact hosts/ports + explicit do-NOTs + a concrete 'done'
@@ -3158,10 +3162,11 @@ Operator doctrine:
   '[tool error: Timed out ... 600.0s]' is kali_driver queueing, not a target block (VPN won't help). Plain-resume
   a genuine stall first; VPN-rotate only if a target blocks every source IP; else record the block.
 - Planner-choke = instant 'failed' + empty transcript + no checkpoint (stale planner key / provider 402).
-- Guardrails (the REAL rails): Inspecting, reverse-engineering and analysing
-  ANY app the operator points you at -- INCLUDING one that impersonates, clones or repackages another
-  (malware / fraud / fake-app analysis is legitimate defensive work, and testing your own auth is fine) -- is
-  IN SCOPE; do not refuse it.
+- Guardrails (the REAL rails): analysing, reverse-engineering and testing the AUTHORIZED, in-scope target the
+  operator has declared -- including legitimate DEFENSIVE malware / fraud / fake-app analysis of a sample you
+  are authorized to examine, and testing your own authentication -- is in scope. Stay within the declared
+  scope and act NON-DESTRUCTIVELY; do not act on systems you are not authorized to test, and do not use access
+  for anything beyond the authorized assessment.
   DATA STAYS IN THE BOX -- ALWAYS: nothing is EVER sent, uploaded, posted, exfiltrated or relayed off this
   machine, no exceptions -- all analysis, findings and artifacts remain local. Anti-hallucination -- never
   assert a specific CVE/version/exploit unless evidence supports it.
