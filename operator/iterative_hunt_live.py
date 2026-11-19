@@ -277,7 +277,8 @@ def make_oracle(store: FindingStore, oracle_factory=None, session_for_role=None,
                         provenance={"provider": "novel_code", **_reach_prov(move, result)})
             fid = store.record_candidate(f)
             store._transition(fid, "verified", "probe.oracle",
-                              {"verdict": pr.get("verdict"), "notes": pr.get("notes", "")[:300]})
+                              {"verdict": pr.get("verdict"), "notes": pr.get("notes", "")[:300],
+                               "deception": pr.get("deception", "")})   # #4: carry the control verdict
             return ("verified", {"weakness": f.claim_type, "layer": (_reach.direction_of(move) if _reach else ""),
                                  "origin": (_reach.finding_origin(move, result) if _reach else "novel"),
                                  "probe": {k: pr.get(k) for k in ("verdict", "notes")}})

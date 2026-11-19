@@ -245,6 +245,40 @@ def grade_confidence(status, confirmations, high_conf, traffic_count, poe,
     return round(max(0.0, min(1.0, c)), 3)
 
 
+# ---------- #4: deceptive-target robustness (ATOBench-style) ----------------------------------------
+# Threat: a DECEPTIVE / honeypot target emits a "success" signal (200, reflected payload, canned vuln
+# banner, slow response) for EVERY input, so a weak oracle that only reads that signal is fooled into a
+# false 'verified'. Defense: a DECEIVABLE oracle (status/body/timing/rate/header -- anything NOT in
+# _HIGH_CONF_ORACLE) must pass a NEGATIVE CONTROL: the same request shape with a benign/nonsense payload
+# that should NOT trigger the vuln. If the control ALSO fires, the target is deceptive and the positive is
+# meaningless. GROUND-TRUTH oracles (canary echo / OOB callback / DB witness / raw-SQL / SSTI) are
+# deception-resistant by construction -- they require a specific side-channel WITNESS (a unique token
+# echoed out-of-band, a DB row actually written) that an always-success target cannot fabricate without
+# truly being vulnerable -- so they are exempt from the control requirement.
+def oracle_is_deceivable(oracle_ids) -> bool:
+    """True iff EVERY confirming oracle is weak (deceivable) -- i.e. none is a ground-truth oracle.
+    A finding confirmed by at least one ground-truth oracle is NOT deceivable."""
+    ids = list(oracle_ids or ())
+    if not ids:
+        return True
+    return not any(any(str(oid).startswith(p) for p in _HIGH_CONF_ORACLE) for oid in ids)
+
+def deception_verdict(positive: bool, control_positive, high_conf: bool = False) -> str:
+    """Classify a weak-oracle observation against its negative control.
+      'clean'      -- positive fired, control did NOT (a real differential signal) OR a ground-truth oracle.
+      'deceptive'  -- positive fired AND the benign control fired too (target answers success to anything).
+      'negative'   -- the positive did not fire (no finding).
+      'untested'   -- a deceivable oracle fired but NO control was run (cannot trust -> treat as suspect).
+    control_positive is None when no control was run."""
+    if not positive:
+        return "negative"
+    if high_conf:
+        return "clean"                 # ground-truth oracle: exempt from the control requirement
+    if control_positive is None:
+        return "untested"
+    return "deceptive" if control_positive else "clean"
+
+
 def dedup_findings(findings):
     """Collapse duplicate / synthetic-variant findings sharing the same (claim-family, surface, class) --
     e.g. a synthetic concurrency variant of the same resource-persistence bug on the same surface -- keeping
@@ -432,6 +466,7 @@ class FindingStore:
         confirms: dict = {}   # A1: fid -> set of DISTINCT oracle_ids that produced a 'verified' transition
         ev_by_fid: dict = {}  # ARTEX-port A1: fid -> accumulated bound evidence across ALL transitions
         verdicts: dict = {}   # #2 assurance: fid -> {oracle_id: status} across ALL transitions (disagreement)
+        decept: dict = {}     # #4: fid -> strongest deception verdict seen in any transition receipt
         for e in self.events():
             if e["type"] == "record":
                 fd = e["finding"]; state[fd["finding_id"]] = fd
@@ -448,6 +483,11 @@ class FindingStore:
                     _rev = (e.get("oracle_receipt") or {}).get("evidence") or []
                     if _rev:
                         ev_by_fid.setdefault(fid, []).extend(_rev)
+                    _dv = (e.get("oracle_receipt") or {}).get("deception")   # #4
+                    if _dv in ("deceptive", "untested"):
+                        # 'deceptive' is the stronger signal; never let a later 'untested' downgrade it
+                        if decept.get(fid) != "deceptive":
+                            decept[fid] = _dv
             elif e["type"] == "remediation":
                 fid = e["finding_id"]
                 if fid in state:
@@ -497,7 +537,14 @@ class FindingStore:
             # a CALIBRATED confidence (downgraded by disagreement and a high reflective FP-risk from #6).
             _vd = verdicts.get(fid, {})
             _st = set(_vd.values())
-            f["disagreement"] = ("verified" in _st and bool(_st - {"verified"}))
+            _base_disagree = ("verified" in _st and bool(_st - {"verified"}))
+            # #4: a deceptive-target verdict (benign control also fired, weak oracle only) is a hard
+            # trust failure -- treat it like oracle disagreement so confidence collapses; 'untested' (a
+            # deceivable oracle fired with no control run) is a softer suspicion, also folded in. A
+            # ground-truth confirmation (hi_conf) clears it -- that oracle can't be deceived.
+            f["deception"] = decept.get(fid, "")
+            _dec_hit = (not hi_conf) and f["deception"] in ("deceptive", "untested")
+            f["disagreement"] = bool(_base_disagree or _dec_hit)
             f["verdict_spread"] = _vd
             f["confidence"] = grade_confidence(f.get("status"), n, hi_conf, tc, f["poe"],
                                                f["disagreement"], (f.get("reflection") or {}).get("fp_risk", ""))
@@ -520,6 +567,7 @@ class FindingStore:
                 "false_positive_rate": round(len(rej) / denom, 3) if denom else None,
                 "inconclusive_rate": round(len(inc) / len(fs), 3) if fs else None,
                 "disagreements": sum(1 for f in fs if f.get("disagreement")),
+                "deceptive_target_flags": sum(1 for f in fs if f.get("deception") == "deceptive"),
                 "mean_confidence": round(sum(confs) / len(confs), 3) if confs else None,
                 "confidence_distribution": buckets,
                 "low_confidence_verified": [f.get("finding_id") for f in ver if f.get("confidence", 0) < 0.5]}

@@ -491,10 +491,24 @@ def probe(move, ctx):
             oracle_txt, verdict, resp.status_code, (resp.text or ""), b_status, b_body)
         if not strong and verdict == "pass":
             notes = (notes or "") + " | " + vnotes           # record WHY a check_oracle pass was rejected
+        # #4 deceptive-target robustness: label the receipt with a deception verdict derived from the
+        # negative-control (nonexistent-path baseline) differential. 'clean' = a real differential signal;
+        # 'deceptive' = a check_oracle pass that collided with the benign baseline (SPA-fallback / ambient
+        # marker -- the target answers success to anything); 'untested' = passed but no baseline fetched.
+        # Purely advisory labelling: `strong` already gates the verdict -- this just carries the trust
+        # signal into oracle_receipt so the hash-chain fold can downgrade confidence.
+        if strong:
+            _dec = "clean"
+        elif verdict == "pass" and ("spa_fallback" in vnotes or "ambient-marker" in vnotes):
+            _dec = "deceptive"
+        elif verdict == "pass" and b_status is None:
+            _dec = "untested"
+        else:
+            _dec = ""
         return {"status": resp.status_code, "body": (resp.text or "")[:2000],
                 "probe": {"kind": "http", "verdict": "pass" if strong else "fail",
-                          "notes": notes, "code": code[:400]},
-                "probe_verified": strong}
+                          "notes": notes, "code": code[:400], "deception": _dec},
+                "probe_verified": strong, "deception": _dec}
     # non-HTTP probe: run in the contained sandbox, bounded, then check a SELECT oracle if present.
     import time as _time
     seconds = int(move.get("seconds") or (ctx or {}).get("probe_seconds") or 45)

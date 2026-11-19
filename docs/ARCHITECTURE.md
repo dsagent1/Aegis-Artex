@@ -304,6 +304,18 @@ direction — MAPTA/JEV-style harnesses):
   artifact, deceptive target, oracle proved the wrong thing), judging only from the finding + receipt + bound
   evidence. It records `{fp_risk, reasons, recommend}` append-only, **lowers confidence, and flags high-risk
   findings for review — but never changes status** (the oracle stays ground truth). Env gate: `AEGIS_REFLECT`.
+- **Deceptive-target robustness (`operator/deception.py`, ATOBench-style).** A deceptive / honeypot target
+  emits a "success" signal (200, reflected payload, canned vuln banner, slow response) for *every* input, so a
+  weak oracle that only reads that signal is fooled. Before a **deceivable** oracle (status/body/timing/rate —
+  anything not in `_HIGH_CONF_ORACLE`) counts a positive, the loop runs a **negative control**: the same
+  request shape with a benign/nonsense payload that must *not* trigger the vuln. `deception_verdict` classifies
+  the pair — `clean` (positive fired, control silent → a real differential signal), `deceptive` (benign control
+  also fired → target says success to anything), `untested` (deceivable oracle fired with no control). A
+  `deceptive`/`untested` verdict on a weak oracle forces `disagreement` in the fold so confidence collapses.
+  **Ground-truth oracles are exempt** — a canary echo / OOB callback / DB witness needs a specific side-channel
+  witness an always-success target cannot fabricate, so a honeypot cannot deceive them (proven in
+  `shared/_deception_tests.py`). In the live loop the novel-code HTTP leg derives the verdict from its existing
+  nonexistent-path baseline differential and carries it into the finding's oracle receipt.
 
 ---
 
