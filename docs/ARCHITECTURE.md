@@ -159,6 +159,20 @@ planner searches an ever-richer graph — paths no single run could see become r
 unioned. The plan's first steps surface as MODE-1 anchor `seed_moves` (`seed_moves_from_plan`), so the plan
 actually steers early execution. Self-tests: `redteam/_planning_tests.py` (16/16).
 
+**Hierarchical task-specific agents (`operator/task_agents.py`, HPTSA-inspired).** HPTSA (Fang et al. 2024)
+showed a *hierarchical* structure — a planner that dispatches **task-specific expert subagents, one per
+vuln class** — beats a single flat agent, from **specialization + separating planning from exploitation**,
+not from any new exploit primitive. This adopts that structure on top of the existing, oracle-verified
+machinery (it adds **no** attack capability): a **planner** picks the vuln classes worth pursuing on this
+target — **relevance-gated by the environment survey** so no off-target class is spawned — a **manager**
+allocates a *depth* sub-budget per class by priority (`allocate_budget`, sums exactly) and then **merges +
+dedups** each specialist's oracle-verified findings into the shared `FindingStore`, and each **specialist**
+is the *same* iterative-hunt loop (same `vectors`, same oracles, same store) **constrained to one class**
+(`class_constrained_brainstorm`) so it goes *deep* — the opt-in DEPTH counterpart to the flat loop's
+deliberate breadth. It is orthogonal to the multi-**model** board (brain diversity) and complements the
+classical planner (goal path). Opt-in: `AEGIS_TASK_AGENTS=0` disables; `AEGIS_TASK_PARALLEL=1` runs
+specialists in a bounded thread pool. Self-tests: `shared/_task_agents_tests.py` (22/22).
+
 ---
 
 ## 5. The iterative-hunt loop (how the budget is spent)
