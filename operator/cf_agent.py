@@ -204,6 +204,11 @@ def _post(model: str, system: str, user: str, max_tokens: int, temperature: floa
     _payload = {"model": resolve(model),
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "max_tokens": max_tokens, "temperature": temperature}
+    # DeepSeek (incl. the CF deepseek-cf flash failover) THINKS by default: reasoning_content eats the
+    # token budget and `content` comes back truncated/empty. This is an answer-only path, so disable it --
+    # mirroring the direct-DS calls. CF accepts a top-level `thinking` field (see code_review.py).
+    if "deepseek" in resolve(model).lower():
+        _payload["thinking"] = {"type": "disabled"}
     if effort and effort != "none":                  # gpt-oss & compatible; sent only when configured
         _payload["reasoning_effort"] = effort
     body = json.dumps(_payload).encode()

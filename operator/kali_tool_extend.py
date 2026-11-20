@@ -87,7 +87,8 @@ def _kali(cmd, timeout=1800):
     else:
         full = ["bash", "-lc", cmd]
         env = dict(os.environ)
-    r = subprocess.run(full, capture_output=True, text=True, timeout=timeout, env=env)
+    r = subprocess.run(full, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       timeout=timeout, env=env)
     return r.returncode, r.stdout, r.stderr
 
 
@@ -219,8 +220,8 @@ def install(name, methods=None, approve_gated=None):
 
 def _autowrap(name, binname):
     """After a successful install, auto-synthesize a STRUCTURED wrapper (invocation template + output
-    parser) so the operator can call the new tool via run_wrapped_tool with normalized output.
-    Best-effort: a failure here never fails the install (the tool is still reachable via run_command)."""
+    parser) so the operator can call the new tool via run_wrapped_tool with normalized output. Best-effort:
+    a failure here never fails the install (the tool is still reachable via run_command)."""
     try:
         import sys as _s
         _s.path.insert(0, HERE)

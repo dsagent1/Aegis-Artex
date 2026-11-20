@@ -3,7 +3,7 @@
 
 When kali_tool_extend installs a new binary, synthesize() derives an invocation
 TEMPLATE + output PARSER + metadata and registers it in tool_wrappers.json, so the
-operator can call the tool as a typed tool (kali_driver's run_tool) with normalized
+operator can call the tool as a typed tool (kali_driver's run_wrapped_tool) with normalized
 output -- matching the turnkey feel of a pre-wrapped tool table while KEEPING our
 unbounded, install-on-demand reach.
 
@@ -291,15 +291,31 @@ def normalize(desc: dict, stdout: str, stderr: str = "", returncode: int = 0) ->
     res = {"tool": desc.get("bin"), "output_mode": mode, "returncode": returncode,
            "provenance": desc.get("provenance"), "confidence": desc.get("confidence")}
     if mode == "json":
-        parsed, err = _try_json(out)
+        # STRICT whole-blob parse first (not a last-line heuristic -- that would swallow ndjson,
+        # returning only the final object). Fall through to ndjson, then raw.
+        _s = (out or "").strip()
+        try:
+            parsed, err = (json.loads(_s) if _s else None), ""
+        except Exception as e:
+            parsed, err = None, str(e)
         if parsed is not None:
             res["normalized"] = parsed
             res["count"] = len(parsed) if isinstance(parsed, list) else 1
         else:
-            res["output_mode"] = "raw"
-            res["normalized"] = None
-            res["parse_error"] = err
-            res["raw_tail"] = _strip_ansi(out)[-4000:]
+            # many tools whose flag is -json/--json actually emit NDJSON (one object per line,
+            # e.g. dnsx, several projectdiscovery tools). Try that before giving up to raw.
+            items, bad = _parse_ndjson(out)
+            if items:
+                res["output_mode"] = "ndjson"
+                res["normalized"] = items
+                res["count"] = len(items)
+                if bad:
+                    res["unparsed_lines"] = bad
+            else:
+                res["output_mode"] = "raw"
+                res["normalized"] = None
+                res["parse_error"] = err
+                res["raw_tail"] = _strip_ansi(out)[-4000:]
     elif mode == "ndjson":
         items, bad = _parse_ndjson(out)
         res["normalized"] = items

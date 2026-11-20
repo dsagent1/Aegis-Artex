@@ -127,6 +127,14 @@ def test_normalize_json_fallback_to_raw():
     ok("raw_tail" in r, "raw tail preserved on parse miss")
 
 
+def test_normalize_json_reclassifies_ndjson():
+    # a tool flagged -json but actually emitting NDJSON (dnsx-class) must parse, not fall to raw
+    desc = {"bin": "dnsx", "output_mode": "json"}
+    r = TW.normalize(desc, '{"host":"a"}\n{"host":"b"}\n')
+    ok(r["output_mode"] == "ndjson", "json-mode with ndjson body reclassified to ndjson")
+    ok(r["count"] == 2, "reclassified ndjson count == 2")
+
+
 def test_normalize_lines_truncation():
     desc = {"bin": "gau", "output_mode": "lines"}
     out = "\n".join(f"line{i}" for i in range(TW._MAX_LINES + 50))
@@ -168,6 +176,7 @@ def main():
                test_build_command_quotes_target, test_build_command_rejects_shell_extra,
                test_build_command_allows_clean_extra, test_normalize_ndjson,
                test_normalize_json_array, test_normalize_json_fallback_to_raw,
+               test_normalize_json_reclassifies_ndjson,
                test_normalize_lines_truncation, test_normalize_strips_ansi,
                test_unsafe_name_rejected, test_roundtrip_registry]:
         print(f"\n[{fn.__name__}]")

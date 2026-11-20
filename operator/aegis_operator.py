@@ -135,6 +135,7 @@ _CF_DEFAULT_TOTAL = 24000
 _CF_CTX_WINDOWS = {
     "llama-4-scout": 131000, "llama-4": 131000,   # Llama 4 Scout: long-context is its headline feature
     "gpt-oss-120b": 128000, "gpt-oss-20b": 128000,  # OpenAI gpt-oss: 128k
+    "deepseek-v4.1-flash": 128000, "deepseek": 64000,  # DS-flash-via-CF is long-context -> don't starve output
     # others intentionally left at the conservative default until confirmed via `cf_agent.py list`
 }
 
@@ -224,9 +225,14 @@ def _create_once(client, **kw):
                 _m["content"] = _scrub_secrets(_m["content"])
     if _provider() == "cloudflare":
         # Cloudflare Workers AI OpenAI-compatible endpoint: standard chat.completions with
-        # max_tokens + temperature; no DeepSeek 'thinking' extra_body, no OpenAI reasoning_effort.
-        # Model is a CF slug, e.g. @cf/qwen/qwen3-30b-a3b-fp8. See cf_models.json.
+        # max_tokens + temperature; no OpenAI reasoning_effort. Model is a CF slug, e.g.
+        # @cf/qwen/qwen3-30b-a3b-fp8. See cf_models.json.
         kw.pop("extra_body", None)
+        # EXCEPTION: DeepSeek-via-CF (the deepseek-cf flash failover) thinks by default -> reasoning eats
+        # the output budget and the turn comes back TRUNCATED. Re-send the thinking-disable (CF accepts a
+        # top-level `thinking` field) so the failover channel returns clean, complete answers.
+        if "deepseek" in (kw.get("model") or "").lower():
+            kw["extra_body"] = {"thinking": {"type": "disabled"}}
         # CF's chat schema REQUIRES every message.content to be a STRING. An assistant tool-call turn stored
         # via model_dump(exclude_none=True) has NO content key (or null), and a tool result can be a dict --
         # both make CF 400 with "oneOf ... Type mismatch of /messages/...". Normalize a COPY (never mutate
