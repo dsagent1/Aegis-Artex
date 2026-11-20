@@ -207,6 +207,7 @@ def install(name, methods=None, approve_gated=None):
                 "version": _tool_version(binname) if landed else "", "gated": method in _GATED_METHODS})
         if ok and landed:
             print(f"[install] {name}: OK via {method}")
+            _autowrap(name, binname)
             return {"name": name, "status": "installed", "method": method, "version": _tool_version(binname)}
         print(f"[install] {name}: {method} did not land ({note[:120]})")
     if skipped_gated:
@@ -214,6 +215,20 @@ def install(name, methods=None, approve_gated=None):
     print(f"[install] {name}: FAILED across {[m for m,_ in plan]} -- may need a manual recipe / docker image")
     _audit({"tool": name, "method": "all", "status": "failed", "tried": [m for m, _ in plan]})
     return {"name": name, "status": "failed", "tried": [m for m, _ in plan]}
+
+
+def _autowrap(name, binname):
+    """After a successful install, auto-synthesize a STRUCTURED wrapper (invocation template + output
+    parser) so the operator can call the new tool via run_wrapped_tool with normalized output.
+    Best-effort: a failure here never fails the install (the tool is still reachable via run_command)."""
+    try:
+        import sys as _s
+        _s.path.insert(0, HERE)
+        import tool_wrapper as TW
+        d = TW.synthesize(name, binname, run=lambda c: _kali(c)[1], write=True)
+        print(f"[install] {name}: wrapped [{d.get('output_mode')}/{d.get('confidence')}] -> {d.get('template')}")
+    except Exception as e:
+        print(f"[install] {name}: wrap skipped ({e})")
 
 
 def refresh_blackarch():

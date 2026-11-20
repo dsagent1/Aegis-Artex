@@ -285,6 +285,77 @@ async def ensure_tool(name: str, hint: str = "", timeout: int = 600) -> dict:
             "path": path, "tried": tried, "install_hint": _TOOL_RECIPES.get(name, hint or "")}
 
 
+def _toolwrap():
+    """Lazy-import operator/tool_wrapper (the structured-wrapper registry) from this sibling package."""
+    global _TW
+    try:
+        return _TW
+    except NameError:
+        pass
+    import os as _os
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    _op = _os.path.join(_os.path.dirname(_here), "operator")
+    if _op not in sys.path:
+        sys.path.insert(0, _op)
+    try:
+        import tool_wrapper as _mod  # noqa
+    except Exception:
+        _mod = None
+    globals()["_TW"] = _mod
+    return _mod
+
+
+@mcp.tool
+async def run_wrapped_tool(name: str, target: str = "", extra_args: str = "", timeout: int = 0) -> dict:
+    """Run an AUTO-WRAPPED tool by NAME with STRUCTURED output. (Named run_wrapped_tool to avoid
+    colliding with the operator's existing generic run_tool / distro_backend.run_tool.)
+
+    A wrapper (built when kali_tool_extend installs the tool) supplies a fixed invocation template
+    and an output parser, so you get normalized JSON/JSONL/line output instead of raw text. If no
+    wrapper is registered for `name`, this returns a hint -- install+wrap it first, or use
+    run_command for a one-off. The template has fixed {target}/{extra} slots: `target` is
+    shell-quoted; `extra_args` is rejected if it contains shell operators (; | & $ ` < > \\).
+
+    :param name: registered wrapper name (see operator/tool_wrappers.json).
+    :param target: the url/host/path the tool runs against (optional for input-less tools).
+    :param extra_args: extra flags, e.g. '-w /usr/share/wordlists/x.txt -t 50' (no shell operators).
+    :param timeout: override seconds (0 = the wrapper's own timeout).
+    :return: {ok, name, command, output_mode, normalized, count?, returncode, provenance, confidence}.
+    """
+    tw = _toolwrap()
+    if tw is None:
+        return {"ok": False, "name": name, "error": "tool_wrapper module unavailable"}
+    reg = tw.load_registry()
+    desc = reg.get(name)
+    if not desc:
+        return {"ok": False, "name": name, "error": "no wrapper registered",
+                "hint": "install+wrap via kali_tool_extend.install(), or use run_command for a one-off"}
+    try:
+        command = tw.build_command(desc, target, extra_args)
+    except ValueError as e:
+        return {"ok": False, "name": name, "error": str(e)}
+    to = timeout or int(desc.get("timeout", 600))
+    _log(f">>> RUN_WRAPPED[{name}] {command}")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "wsl", "-d", WSL_DISTRO, "-u", "root", "--", "bash", "-lc", f"cd ~ && {command}",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd="C:\\")
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=to)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return {"ok": False, "name": name, "command": command, "timed_out": True,
+                "error": f"killed after {to}s timeout"}
+    except Exception as e:
+        return {"ok": False, "name": name, "command": command, "error": str(e)}
+    stdout = stdout_b.decode("utf-8", errors="replace")
+    stderr = stderr_b.decode("utf-8", errors="replace")
+    result = tw.normalize(desc, stdout, stderr, proc.returncode)
+    result.update({"ok": True, "name": name, "command": command})
+    _log(f"<<< RUN_WRAPPED[{name}] mode={result.get('output_mode')} count={result.get('count')}")
+    return result
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")

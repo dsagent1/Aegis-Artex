@@ -67,3 +67,7 @@ redteam/attack_graph.json
 operator/run_heartbeat.json
 operator/run_telemetry.jsonl
 operator/hunt_findings.jsonl
+
+# auto-wrap runtime data (generated at tool-install time, never committed)
+operator/tool_wrappers.json
+operator/tool_install_audit.jsonl
