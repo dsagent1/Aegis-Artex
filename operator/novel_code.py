@@ -60,8 +60,8 @@ def _direction(move) -> str:
 #     novel-code move, qwq-32b analyst picks the best, preferring agreement -- the DS<->KIMI convergence-
 #     trust signal. ~2x writer cost on novel-code moves only; single-writer fallback path stays available.
 PRIMARY_WRITER = "ds"
-FALLBACK_ORDER = ["ds", "kimi-k2.7-code", "qwen2.5-coder-32b", "llama-4-scout", "llama-3.3-70b"]
-ENSEMBLE_MODELS = ["ds", "kimi-k2.7-code"]
+FALLBACK_ORDER = ["ds", "qwen2.5-coder-32b", "llama-4-scout", "llama-3.3-70b", "deepseek-cf"]  # kimi retired on CF 2026-11-20
+ENSEMBLE_MODELS = ["ds", "qwen2.5-coder-32b"]
 
 
 def _fallback_order():

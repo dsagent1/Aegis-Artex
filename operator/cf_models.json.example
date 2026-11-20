@@ -1,6 +1,12 @@
 {
-  "_note": "Map board seat name -> Cloudflare Workers AI slug. Needs CF_ACCOUNT_ID + CF_API_TOKEN in secret.env. Copy to cf_models.json.",
+  "_note": "Map board seat name -> Cloudflare Workers AI slug. Needs CF_ACCOUNT_ID + CF_API_TOKEN in secret.env. Copy to cf_models.json. Slugs change over time -- verify callable ones with `python cf_agent.py list` or `python cf_health.py`; a deprecated slug returns 410 and (with 410 in the failover pattern) fails over instead of crashing. 'deepseek-cf' is the DeepSeek-flash-via-CF channel used as a failover for the direct api.deepseek.com path.",
+  "deepseek-cf": "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+  "ds-cf": "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
   "qwen2.5-coder-32b": "@cf/qwen/qwen2.5-coder-32b-instruct",
   "llama-3.3-70b": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-  "gpt-oss-120b": "@cf/openai/gpt-oss-120b"
+  "llama-4-scout": "@cf/meta/llama-4-scout-17b-16e-instruct",
+  "gpt-oss-120b": "@cf/openai/gpt-oss-120b",
+  "gpt-oss-20b": "@cf/openai/gpt-oss-20b",
+  "mistral-small-24b": "@cf/mistralai/mistral-small-3.1-24b-instruct",
+  "glm-5.3": "@cf/zai-org/glm-5.3"
 }

@@ -18,8 +18,11 @@
   "gpt-oss-120b": "@cf/openai/gpt-oss-120b lineage, now served via GROQ (free) -- OpenAI-lineage breadth/dissent on the board.",
   "mistral-small-24b": "@cf/mistralai/mistral-small-3.1-24b-instruct -- distinct Mistral lineage, non-reasoning -> fast/clean/cheap (3/5)."
  },
+ "_update_2026_11_20": "Cloudflare retired a large batch of Workers-AI models today (verified by live inference): kimi-k2.6, kimi-k2.7-code, deepseek-v4-pro-0813, deepseek-v4-flash-0731, qwq-32b, deepseek-r1-distill-qwen-32b, qwen3-30b-a3b-fp8, glm-5.2, glm-5.3-flash -> all 410. LIVE CF roster now (cf_health 8/8 OK): deepseek-cf (@cf/deepseek-ai/deepseek-v4.1-flash-1017), gpt-oss-120b, gpt-oss-20b, mistral-small-24b, llama-3.3-70b, llama-4-scout, qwen2.5-coder-32b, glm-5.3. Added 'deepseek-cf' = DeepSeek FLASH via Cloudflare, a failover channel for the DIRECT api.deepseek.com path (used on 402/quota/410); direct DeepSeek (flash chat + pro escalation) is unaffected. kimi/qwq/r1-distill removed from coders & board; qwen3-30b (chat default) and the kimi aliases repointed to qwen2.5-coder; 410 added to the failover pattern so a deprecated model fails over instead of crashing the turn.",
  "active_cf_optional": {
-  "qwen2.5-coder-32b": "@cf/qwen/qwen2.5-coder-32b-instruct"
+  "deepseek-cf": "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+  "qwen2.5-coder-32b": "@cf/qwen/qwen2.5-coder-32b-instruct",
+  "glm-5.3": "@cf/zai-org/glm-5.3"
  },
  "dropped": {
   "gpt-oss-20b": "REDUNDANT with gpt-oss-120b (same OpenAI lineage); 2/5 on-task. Kept 120b for the lineage, dropped 20b (2026-09-14).",

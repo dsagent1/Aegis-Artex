@@ -35,7 +35,8 @@ param(
   [string]$Session,
   [switch]$Resume,                        # load the saved session on start (default file is saved every turn but only picked up on request; or type /resume live)
   [string]$SecretEnv,
-  [string]$Provider = 'deepseek'
+  [string]$Provider = 'deepseek',
+  [string]$Fallback = 'deepseek-cf'       # on a direct-DS error (402 low-credit / 410 deprecated / quota), fail OVER to DeepSeek-flash via Cloudflare
 )
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -71,6 +72,9 @@ $env:PYTHONUTF8 = '1'
 # brain + helper policy (override whatever secret.env set): flash primary, gpt-oss-120b helper
 $env:AEGIS_MODEL = $Brain
 $env:AEGIS_CF_HELPER = $CfHelper
+# Failover ladder: if secret.env didn't set one, default to deepseek-cf so a direct-DS 402/410/quota error
+# fails OVER to DeepSeek-flash via Cloudflare instead of crashing the turn (CF bills Neurons, not DS credit).
+if ([string]::IsNullOrWhiteSpace($env:AEGIS_FALLBACK)) { $env:AEGIS_FALLBACK = $Fallback }
 if ($Target) { $env:AEGIS_TARGET = $Target }
 
 # --- pick python: $env:AEGIS_PYTHON wins, else python on PATH ---

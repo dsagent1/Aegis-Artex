@@ -5,9 +5,9 @@ import sys, os, time, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cf_agent
 
-DEFAULT = ["kimi-k2.6", "qwq-32b", "gpt-oss-120b", "gpt-oss-20b", "mistral-small-24b", "llama-3.3-70b",
-           "llama-4-scout", "qwen2.5-coder-32b", "deepseek-r1-distill-32b", "gemma-4-26b",
-           "kimi-k2.7-code", "nemotron-120b", "glm-5.2"]
+# Live CF roster as of 2026-11-20 (post Cloudflare deprecation batch). Verify anytime: python cf_health.py
+DEFAULT = ["deepseek-cf", "gpt-oss-120b", "gpt-oss-20b", "mistral-small-24b", "llama-3.3-70b",
+           "llama-4-scout", "qwen2.5-coder-32b", "glm-5.3"]
 
 
 def _ping(m, big=False):

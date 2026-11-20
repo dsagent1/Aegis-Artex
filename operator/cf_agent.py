@@ -135,14 +135,12 @@ CODE_FLAVOURED_ROLE = (
     "assertion, or a rendered-output check) plus the expected PASS condition.\n"
     "Output ONLY a numbered list of such suggestions - no preamble, no essay. Keep each self-contained."
 )
-# kimi-k2.7-code is a first-class exploit-CODE writer (like qwen2.5-coder); kimi-k2.6 is a strong
-# general consultant. Both need the CF Workers PAID plan -- until then they 403 and are skipped
-# gracefully (see _post), so listing them here is safe and they activate the moment the plan is on.
+# Code-flavoured roles for the live CF coders. (kimi-k2.7-code / deepseek-r1-distill were retired on
+# Cloudflare 2026-11-20 -> 410; removed. deepseek-cf = DeepSeek flash via CF, the direct-DS failover.)
 ROLE_PROMPTS = {"qwen2.5-coder-32b": CODE_FLAVOURED_ROLE,
-                "kimi-k2.7-code": CODE_FLAVOURED_ROLE,
-                "llama-3.3-70b": CODE_FLAVOURED_ROLE,   # fast, direct exploit-code writer (CF paid)
-                "llama-4-scout": CODE_FLAVOURED_ROLE,   # Llama-4 MoE coder (bake-off winner, CF paid)
-                "deepseek-r1-distill-32b": CODE_FLAVOURED_ROLE}  # reasoning-coder (CF paid)
+                "deepseek-cf": CODE_FLAVOURED_ROLE,     # DeepSeek flash via Cloudflare (direct-DS failover)
+                "llama-3.3-70b": CODE_FLAVOURED_ROLE,   # fast, direct exploit-code writer
+                "llama-4-scout": CODE_FLAVOURED_ROLE}   # Llama-4 MoE coder (bake-off winner)
 
 def _role_for(model: str) -> str:
     """Baked-in system role for a model, matched by friendly name or resolved @cf slug."""

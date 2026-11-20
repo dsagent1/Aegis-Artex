@@ -171,8 +171,8 @@ def _cf_input_est(messages, tools):
 # Inert unless _CTX["fallback"] is populated (run_chat does this from AEGIS_FALLBACK). Each leg is a brain
 # NAME with its own default model, so no per-model mapping is needed. Entries with no key are skipped.
 _FAILOVER_PAT = re.compile(
-    r"\b(402|403|408|409|413|429|5\d\d)\b|rate.?limit|quota|insufficient|capacity|overload|unavailable|"
-    r"too many requests|tokens? per (minute|day)|\btpm\b|\brpd\b|\brpm\b|exceeded|throttl", re.I)
+    r"\b(402|403|408|409|410|413|429|5\d\d)\b|rate.?limit|quota|insufficient|capacity|overload|unavailable|"
+    r"too many requests|tokens? per (minute|day)|\btpm\b|\brpd\b|\brpm\b|exceeded|throttl|deprecat", re.I)
 
 def _is_failover_error(e) -> bool:
     return bool(_FAILOVER_PAT.search(repr(e)))
@@ -1020,7 +1020,9 @@ def _chat_search(term):
 # Each entry gets the short form /<brain> (thinking OFF) and /<brain>-think (ON). scout is a chat driver:
 # plain chat is solid and the loop auto-retries its occasional blank turn (commit 2be5998).
 # groq + gemini are board-only (groq 413s on the full tools payload; gemini free-quota 429s).
-_BRAIN_CMDS = {"ds": ("/deepseek",), "kimi": ("/k2",), "kimi-code": ("/k2-code",),
+# kimi (/k2, /k2-code) RETIRED on Cloudflare 2026-11-20 -> dropped from the menu (aliases still resolve to
+# live fallbacks for back-compat). ds-cf = DeepSeek flash via Cloudflare -- the direct-DS failover channel.
+_BRAIN_CMDS = {"ds": ("/deepseek",), "ds-cf": ("/dscf", "/deepseek-cf"),
                "qwen": ("/qw",), "scout": ("/llama4",), "llama": ("/l",),
                "cerebras": ("/cb",), "openrouter": ("/or",)}
 
@@ -3342,10 +3344,17 @@ def _resolve_key_endpoint():
 # Chat /kimi uses the GENERAL K2.6 (better conversational fit, instruction-following, a hair faster);
 # the code-specialized K2.7-code is a SEPARATE chat brain (/kimi-code) and remains what the code bench
 # (code_suggester.py) and board use. Both override via env.
-KIMI_MODEL = os.environ.get("AEGIS_KIMI_MODEL", "@cf/moonshotai/kimi-k2.6")
-KIMI_CODE_MODEL = os.environ.get("AEGIS_KIMI_CODE_MODEL", "@cf/moonshotai/kimi-k2.7-code")
+# DeepSeek via Cloudflare Workers AI -- an ALTERNATE DS channel to the direct api.deepseek.com path, used
+# as a failover leg when the direct path is low on credit (402/quota) or deprecated (410). CF serves only
+# DeepSeek FLASH now (v4-pro-0813 / v4-flash-0731 were deprecated 2026-11-20); pro escalation stays on the
+# direct path. Override with AEGIS_DEEPSEEK_CF_MODEL.
+DEEPSEEK_CF_MODEL = os.environ.get("AEGIS_DEEPSEEK_CF_MODEL", "@cf/deepseek-ai/deepseek-v4.1-flash-1017")
+# Moonshot KIMI was DEPRECATED on Cloudflare 2026-11-20 (both kimi-k2.6 AND kimi-k2.7-code -> 410). The kimi
+# aliases now resolve to LIVE CF models so nothing 410s: general -> DeepSeek-CF flash, coder -> qwen2.5-coder.
+KIMI_MODEL = os.environ.get("AEGIS_KIMI_MODEL", DEEPSEEK_CF_MODEL)
+KIMI_CODE_MODEL = os.environ.get("AEGIS_KIMI_CODE_MODEL", "@cf/qwen/qwen2.5-coder-32b-instruct")
 LLAMA_MODEL = os.environ.get("AEGIS_LLAMA_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
-QWEN_MODEL = os.environ.get("AEGIS_QWEN_MODEL", "@cf/qwen/qwen3-30b-a3b-fp8")           # cheap MoE, drives the loop
+QWEN_MODEL = os.environ.get("AEGIS_QWEN_MODEL", "@cf/qwen/qwen2.5-coder-32b-instruct")  # qwen3-30b deprecated on CF 2026-11-20; 2.5-coder is the live qwen
 SCOUT_MODEL = os.environ.get("AEGIS_SCOUT_MODEL", "@cf/meta/llama-4-scout-17b-16e-instruct")
 CLAUDE_MODEL = os.environ.get("AEGIS_CLAUDE_MODEL", "sonnet")  # `claude -p` model: fast Sonnet by default (vs Opus)
 # Cerebras + Gemini: OpenAI-compatible free-tier providers. /cerebras and /gemini chat brains; or
@@ -3360,14 +3369,18 @@ _CHAT_LADDER_EXCLUDE = {"groq", "gemini", "gem", "flash"}
 # named CF brains + aliases -> CF model slug (short, curated names for --brain / live /kimi /qwen /scout).
 # The benchmarked reliable CF drivers are kimi, qwen (cheapest) and scout; llama-3.3 is kept but text-emits.
 _CF_BRAINS = {
-    "kimi": KIMI_MODEL, "k2": KIMI_MODEL, "kimi-k2.6": KIMI_MODEL,
+    # DeepSeek via CF (flash) -- the alternate DS channel / direct-DS failover leg
+    "deepseek-cf": DEEPSEEK_CF_MODEL, "ds-cf": DEEPSEEK_CF_MODEL, "dscf": DEEPSEEK_CF_MODEL,
+    "deepseek-v4.1-flash": DEEPSEEK_CF_MODEL,
+    "kimi": KIMI_MODEL, "k2": KIMI_MODEL, "kimi-k2.6": KIMI_MODEL,   # kimi deprecated on CF -> live fallbacks
     "kimi-code": KIMI_CODE_MODEL, "kimi-coder": KIMI_CODE_MODEL, "kimicoder": KIMI_CODE_MODEL,
     "k2-code": KIMI_CODE_MODEL, "kimi-k2.7-code": KIMI_CODE_MODEL,
     "qwen": QWEN_MODEL, "qwen3": QWEN_MODEL, "qwen3-30b": QWEN_MODEL,
     "scout": SCOUT_MODEL, "llama4": SCOUT_MODEL, "llama-4": SCOUT_MODEL,
     "llama": LLAMA_MODEL, "llama3": LLAMA_MODEL, "llama-3.3": LLAMA_MODEL,
 }
-_BRAIN_CANON = {"k2": "kimi", "kimi-k2.6": "kimi",
+_BRAIN_CANON = {"ds-cf": "deepseek-cf", "dscf": "deepseek-cf", "deepseek-v4.1-flash": "deepseek-cf",
+                "k2": "kimi", "kimi-k2.6": "kimi",
                 "kimi-coder": "kimi-code", "kimicoder": "kimi-code", "k2-code": "kimi-code",
                 "kimi-k2.7-code": "kimi-code",
                 "qwen3": "qwen", "qwen3-30b": "qwen",
@@ -4396,11 +4409,11 @@ if __name__ == "__main__":
                          "(GPT-5.6 Sol via OPENAI_API_KEY), 'cerebras' (CEREBRAS_API_KEY) or 'gemini' "
                          "(GEMINI_API_KEY, OpenAI-compat endpoint). Sets AEGIS_PROVIDER; pair with --model.")
     ap.add_argument("--brain", default=os.environ.get("AEGIS_BRAIN", "ds"),
-                    help="driving model: 'ds' (DeepSeek, default), 'kimi', 'kimi-code', 'qwen', 'scout', "
-                         "'llama', 'cerebras', 'openrouter', 'claude' (local claude CLI, not the API), any "
-                         "cf_models.json name, or a raw @cf/... slug. Switch live in --chat with /ds, /kimi, "
-                         "/kimi-code, /qwen, /scout, /llama, /cerebras, /openrouter, /claude. "
-                         "(groq/gemini are board-only, not chat drivers.)")
+                    help="driving model: 'ds' (DeepSeek direct, default), 'ds-cf' (DeepSeek flash via "
+                         "Cloudflare -- direct-DS failover), 'qwen', 'scout', 'llama', 'cerebras', "
+                         "'openrouter', 'claude' (local claude CLI, not the API), any cf_models.json name, or "
+                         "a raw @cf/... slug. Switch live in --chat with /ds, /ds-cf, /qwen, /scout, /llama, "
+                         "/cerebras, /openrouter, /claude. (groq/gemini are board-only, not chat drivers.)")
     ap.add_argument("--think", action="store_true", help="enable DS thinking mode (default off)")
     ap.add_argument("--max-iter", type=int, default=int(os.environ.get("AEGIS_MAX_ITER", "40")),
                     help="max reasoning/act cycles for a task run (default 40, or $AEGIS_MAX_ITER). "

@@ -157,8 +157,8 @@ def cf(q):
 # (NOT the code-writer ROLE_PROMPTS role) -- we want their OPINION here, not TARGET/CODE/ORACLE blocks.
 # Reasoning model (kimi) gets a bigger budget so it lands a FINAL answer, not raw CoT. r1-distill DROPPED
 # 2026-09-20 (timed out to empty, unreliable on CF); nemotron-120b added (proven fast + reliable coder).
-CODER_PANEL = [("kimi-k2.7-code", 2800), ("llama-3.3-70b", 1600),
-               ("llama-4-scout", 1600), ("nemotron-120b", 1600)]
+CODER_PANEL = [("qwen2.5-coder-32b", 1600), ("llama-3.3-70b", 1600),
+               ("llama-4-scout", 1600), ("gpt-oss-120b", 1600)]  # kimi + nemotron retired on CF 2026-11-20 -> live coders
 
 
 def coders(q):
@@ -183,18 +183,16 @@ def coders(q):
 # member name -> (kind, model, default_tokens). "ds"/"sol" are direct; everything else via cf_agent.
 _MEMBERS = {
     "ds": ("ds", "deepseek-v4-pro", 2200), "sol": ("sol", "gpt-5.6", 2000),
+    "deepseek-cf": ("cf", "deepseek-cf", 2200),   # DeepSeek flash via Cloudflare -- direct-DS failover channel
     "gpt-oss-120b": ("cf", "gpt-oss-120b", 1600), "gpt-oss-20b": ("cf", "gpt-oss-20b", 1200),
     "mistral-small-24b": ("cf", "mistral-small-24b", 1400), "qwen2.5-coder-32b": ("cf", "qwen2.5-coder-32b", 1600),
     "llama-3.3-70b": ("cf", "llama-3.3-70b", 1400), "llama-4-scout": ("cf", "llama-4-scout", 1400),
-    "glm-5.2": ("cf", "glm-5.2", 1800), "gemma-4-26b": ("cf", "gemma-4-26b", 1400),
-    "kimi-k2.6": ("cf", "kimi-k2.6", 2800), "kimi-k2.7-code": ("cf", "kimi-k2.7-code", 2800),
-    "deepseek-r1-distill-32b": ("cf", "deepseek-r1-distill-32b", 4000), "qwq-32b": ("cf", "qwq-32b", 4000),
-    "nemotron-120b": ("cf", "nemotron-120b", 2200),
+    "glm-5.3": ("cf", "glm-5.3", 1800),
 }
 # Named presets so a caller (or the skill) picks a tier by intent, not by typing model lists.
 _PRESETS = {
-    "fast": ["ds", "gpt-oss-120b", "qwen2.5-coder-32b", "llama-3.3-70b", "llama-4-scout", "glm-5.2", "mistral-small-24b"],
-    "deep": ["ds", "qwen2.5-coder-32b", "kimi-k2.6", "glm-5.2", "gpt-oss-120b", "nemotron-120b"],
+    "fast": ["ds", "gpt-oss-120b", "qwen2.5-coder-32b", "llama-3.3-70b", "llama-4-scout", "glm-5.3", "mistral-small-24b"],
+    "deep": ["ds", "qwen2.5-coder-32b", "deepseek-cf", "glm-5.3", "gpt-oss-120b", "llama-4-scout"],
     "full": list(_MEMBERS.keys()),
 }
 
@@ -388,7 +386,7 @@ def consult(question, members=None, timeout=None, summarise=True, report_path=No
                 "(2) a NAMED dissent section (who disagreed and why -- never averaged), (3) recommendation. Terse markdown.")
     _sum_usr = f"QUESTION:\n{question}\n\nDISSENT:\n{result['dissent']}\n\nBALLOTS:\n{ballots}"
     result["summary"] = (_summ("ds", _sum_sys, _sum_usr, 1800)
-                         or _summ("kimi-k2.7-code", _sum_sys, _sum_usr, 2400)
+                         or _summ("gpt-oss-120b", _sum_sys, _sum_usr, 2400)
                          or _fallback_summary(ok, result["dissent"]))
 
     _cost_note(result, prof)
