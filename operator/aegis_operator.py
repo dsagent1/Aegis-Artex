@@ -673,7 +673,7 @@ def _start_reader():
     _READER_THREAD = threading.Thread(target=_run, daemon=True); _READER_THREAD.start()
     return _STDIN_Q
 
-_BLOCKING_TOOLS = {"run_command", "run_in_kali", "run_tool"}   # long, blocking; run these off the main thread
+_BLOCKING_TOOLS = {"run_command", "run_in_kali", "run_tool", "run_wrapped_tool"}   # long, blocking; run these off the main thread
 
 
 def _short(s, n=64):
@@ -695,8 +695,8 @@ def _describe_tool(name, args):
         if name == "search_docs":       return f"Searching docs for {_short(a.get('query') or a.get('q'), 48)!r}"
         if name in ("write_file", "install_kali_tool"): return f"Writing {bn(a.get('path'))}"
         if name in ("apply_edit", "multi_edit"):        return f"Editing {bn(a.get('path'))}"
-        if name in ("run_command", "run_in_kali", "run_background", "run_tool"):
-            return f"Running: {_short(a.get('command') or a.get('cmd') or a.get('tool'), 60)}"
+        if name in ("run_command", "run_in_kali", "run_background", "run_tool", "run_wrapped_tool"):
+            return f"Running: {_short(a.get('command') or a.get('cmd') or a.get('tool') or a.get('name'), 60)}"
         if name in ("fetch_url", "render_page"):        return f"Fetching {_short(a.get('url'), 60)}"
         if name == "get_status":        return "Checking task status"
         if name == "read_task_context": return f"Reading task {_short(a.get('token') or a.get('task_id'), 24)} context"
@@ -2230,6 +2230,62 @@ def t_run_tool(tool, args=""):
         return json.dumps({"error": repr(e)[:200]})
 
 
+def t_run_wrapped_tool(name, target="", extra_args=""):
+    """Run an AUTO-WRAPPED tool by NAME with STRUCTURED output (parsed JSON/JSONL/lines, not raw text). A
+    wrapper (built by kali_tool_extend on install) supplies a fixed invocation template + output parser; if
+    none exists yet the tool is installed + wrapped ON DEMAND, then run. FIXED {target}/{extra} slots: target
+    is shell-quoted, extra_args is REJECTED if it contains shell operators. Gated; runs in Kali vs the
+    AUTHORIZED target. Prefer over run_tool when you want parsed results (nuclei/httpx/katana/subfinder ndjson)."""
+    try:
+        import tool_wrapper as TW
+        desc = TW.load_registry().get(name)
+        if not desc:                                    # not wrapped yet -> ensure installed, then synthesize
+            def _khelp(c):
+                try:
+                    return subprocess.run(["wsl", "-d", "kali-linux", "-u", "root", "--", "bash", "-lc", c],
+                                          capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                          timeout=60, stdin=subprocess.DEVNULL).stdout
+                except Exception:
+                    return ""
+            try:
+                import kali_tool_extend as KTE
+                KTE.install(name)                       # no-op if already present; fetches it if missing
+            except Exception:
+                pass
+            try:                                        # synthesize handles present AND freshly-installed tools
+                desc = TW.synthesize(name, name, run=_khelp, write=True)  # curated -> --help introspection
+            except Exception as _e:
+                return json.dumps({"error": f"wrap failed for {name!r}: {repr(_e)[:120]}"})
+            if not desc or not desc.get("template"):
+                return json.dumps({"error": f"could not wrap {name!r}; try run_tool/run_in_kali instead"})
+        try:
+            command = TW.build_command(desc, target, extra_args)
+        except ValueError as _ve:
+            return json.dumps({"error": str(_ve)})      # shell operators in extra_args -> rejected
+        _to = min(int(desc.get("timeout", 240) or 240), 600)
+        p = subprocess.run(["wsl", "-d", "kali-linux", "-u", "root", "--", "bash", "-lc", command],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=_to, stdin=subprocess.DEVNULL)
+        res = TW.normalize(desc, p.stdout, p.stderr, p.returncode)
+        res["command"] = command
+        _MAXB = 12000                                   # keep the tool payload model-sized, ALWAYS valid JSON
+        out = json.dumps(res, default=str)
+        if len(out) > _MAXB and isinstance(res.get("normalized"), list):
+            trimmed = []                                # per-item cap (tools like katana embed full bodies)
+            for _it in res["normalized"][:25]:
+                _s = json.dumps(_it, default=str)
+                trimmed.append(_it if len(_s) <= 400 else _s[:400] + "...<trunc>")
+            res["normalized"] = trimmed
+            res["note"] = f"payload trimmed to fit (full count={res.get('count')})"
+            out = json.dumps(res, default=str)
+        if len(out) > _MAXB:                            # still large -> drop to a summary line
+            res["normalized"] = f"<{res.get('count')} items; too large to inline -- narrow the scope>"
+            out = json.dumps(res, default=str)
+        return out
+    except Exception as e:
+        return json.dumps({"error": repr(e)[:200]})
+
+
 def t_install_kali_tool(name, content, interpreter="python3", pip_deps=None):
     """Install a co-pilot-AUTHORED tool into Kali's /usr/local/bin so it becomes a callable command. Stages the
     script in the repo (version-controllable), then copies it into Kali, strips CRLF, chmod +x, and optionally
@@ -3071,6 +3127,12 @@ TOOLS = {
     "Kali. Gated. Prefer this over run_in_kali for any off-the-shelf CLI tool (feroxbuster, katana, dalfox, "
     "nuclei, sn0int, ...). args = the argument string.",
     {"tool": {"type": "string"}, "args": {"type": "string"}}, ["tool"])),
+ "run_wrapped_tool": (t_run_wrapped_tool, False, _spec("run_wrapped_tool",
+    "Run an auto-wrapped tool by NAME with STRUCTURED/parsed output (JSON/JSONL/lines) instead of raw text; "
+    "installs + wraps the tool on demand if needed. Gated; runs in Kali vs the authorized target. Prefer over "
+    "run_tool when you want parsed results (nuclei/httpx/katana/subfinder ndjson). target = url/host/path; "
+    "extra_args = extra flags (no shell operators).",
+    {"name": {"type": "string"}, "target": {"type": "string"}, "extra_args": {"type": "string"}}, ["name"])),
  "install_kali_tool": (t_install_kali_tool, False, _spec("install_kali_tool",
     "Install a co-pilot-authored tool into Kali's /usr/local/bin (staged in the repo first). Gated. For a novel "
     "checker/PoC when no off-the-shelf tool exists.",
@@ -3874,6 +3936,12 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                              "step ACTUALLY work -- check the tool result, don't assume? If something failed "
                              "transiently, retry or route around it; if an approach is stuck, change it. Then act "
                              "or finish()."})
+        # STICK AFTER FAILOVER: if a prior turn's _create advanced the AEGIS_FALLBACK ladder, _CTX now holds
+        # the new client+model. Adopt them so THIS and every later turn use the failed-over provider instead of
+        # re-calling the dead one (which would 402/crash again). Fires once post-failover (then _CTX["client"]
+        # == client, so it's inert and never disturbs the normal / sub-model-escalation path).
+        if _CTX.get("client") is not None and _CTX.get("client") is not client:
+            client = _CTX["client"]; cur_model = _CTX.get("model", cur_model)
         _mt = _think_max if thinking else (_pro_max if cur_model != _BRAIN_LADDER[0] else _base_max)
         kw = dict(model=cur_model, messages=messages, tools=specs, tool_choice="auto",
                   temperature=0.2, max_tokens=_mt)
@@ -4018,7 +4086,7 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
             if name in ("record_finding", "chain_state"):      # record-as-you-go tracking
                 turns_since_record = 0
                 interacted_since_record = False
-            elif name in ("run_in_kali", "run_command", "run_background", "fetch_url", "render_page", "run_tool"):
+            elif name in ("run_in_kali", "run_command", "run_background", "fetch_url", "render_page", "run_tool", "run_wrapped_tool"):
                 interacted_since_record = True
                 mutated_unverified = False   # an exercise/verify step -> a prior edit is now being tested
             try:
@@ -4203,12 +4271,22 @@ def _banner(model, endpoint, gate, mode="autonomous"):
 
 def run(task_text, model, thinking, max_iter, gate, remediate_on_finish=False):
     brain = _CTX.get("brain") or os.environ.get("AEGIS_BRAIN", "ds")
+    _ds_model = model or os.environ.get("AEGIS_MODEL", "deepseek-flash")
+    # Failover ladder (parity with --chat/run_chat): AEGIS_FALLBACK -> on a provider 402/quota/TPM/5xx the
+    # one-shot --task driver fails OVER to the next credentialed leg instead of CRASHING. Empty -> inert.
+    _lad = [b.strip() for b in os.environ.get("AEGIS_FALLBACK", "").split(",") if b.strip()]
+    _lad = [b for b in _lad if b.lower() not in _CHAT_LADDER_EXCLUDE]            # drop tool-incompatible legs
+    _lad = [b for b in _lad if _apply_brain(b, ds_model=_ds_model)[0] is not None]  # keep only credentialed legs
     client, model, label = _apply_brain(brain, ds_model=model)
     if client is None:
         print("[ds-operator] " + label, flush=True)
         return
     _, endpoint = _resolve_key_endpoint()
-    _CTX.update(client=client, model=model, thinking=thinking, gate=gate, depth=0, sub_max_iter=8, brain=brain)
+    _CTX.update(client=client, model=model, thinking=thinking, gate=gate, depth=0, sub_max_iter=8,
+                brain=_BRAIN_CANON.get(brain, brain), ds_model=_ds_model, label=label,
+                fallback=_lad, fallback_i=-1)
+    if _lad:
+        print(f"[ds-operator] failover ladder (on error only): {label} -> {' -> '.join(_lad)}", flush=True)
     _banner(model, endpoint, gate)
     messages = [{"role": "system", "content": SYSTEM + _DOCTRINE + _skill_preface() + _mode_policy(TARGET_MODE) + _memory_preface() + _ledger_block()}, {"role": "user", "content": task_text}]
     summ = _agent_loop(client, model, thinking, messages, list(TOOLS.keys()), max_iter, gate, depth=0, tag="[DS")
