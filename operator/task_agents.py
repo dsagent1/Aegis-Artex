@@ -106,15 +106,21 @@ def _class_weight(cls: str) -> int:
 
 def allocate_budget(classes: list, total: int) -> dict:
     """MANAGER step: split a DEPTH budget across specialists in proportion to class priority, with a
-    floor of 1 each so no funded lane starves. Deterministic + order-stable."""
+    floor of 1 each so no funded lane starves. Deterministic + order-stable. When the budget is too small
+    to give every lane its floor of 1, only the top-priority `total` lanes are funded, so the allocation
+    never overshoots the cap."""
     classes = [c for c in classes if c]
     if not classes or total <= 0:
         return {}
     weights = {c: _class_weight(c) for c in classes}
+    order = sorted(classes, key=lambda c: (-weights[c], c))
+    if total < len(order):                 # can't floor-fund every lane -> fund only the top-priority ones
+        order = order[:total]
+        classes = list(order)
+        weights = {c: weights[c] for c in classes}
     wsum = sum(weights.values()) or 1
     alloc = {c: max(1, (total * weights[c]) // wsum) for c in classes}
     # trim/greedily-add to hit `total` exactly (highest weight adjusts first)
-    order = sorted(classes, key=lambda c: (-weights[c], c))
     diff = total - sum(alloc.values())
     i = 0
     while diff != 0 and order:
@@ -179,11 +185,16 @@ class HierarchicalTeam:
     class-constrained brainstorm, sharing one execute/oracle/store; inject a stub for testing."""
 
     def __init__(self, brainstorm, execute, oracle, *, store=None, seed_moves=None,
-                 run_specialist: Optional[Callable] = None, **hunt_kwargs):
+                 target=None, objective=None, run_specialist: Optional[Callable] = None, **hunt_kwargs):
         self.brainstorm, self.execute, self.oracle = brainstorm, execute, oracle
         self.store = store
         self.seed_moves = seed_moves or []
         self.hunt_kwargs = hunt_kwargs
+        # IterativeHunt.run(target, objective) takes two REQUIRED positional args -- a specialist must pass
+        # them or every hunt raises TypeError (silently swallowed below) and the whole team no-ops. Default
+        # to the live target/objective; run() can override per invocation.
+        self.target = target or os.environ.get("AEGIS_TARGET", "https://localhost:8443")
+        self.objective = objective or "hierarchical specialist depth hunt"
         self._run_specialist = run_specialist or self._default_run_specialist
 
     def _default_run_specialist(self, cls: str, budget: int) -> SpecialistResult:
@@ -193,7 +204,7 @@ class HierarchicalTeam:
                              self.execute, self.oracle, budget=budget, seed_moves=seeds, **self.hunt_kwargs)
         summary = {}
         try:
-            summary = hunt.run() or {}
+            summary = hunt.run(self.target, self.objective) or {}
         except Exception as e:                         # a crashing specialist never sinks the whole team
             summary = {"error": str(e)[:200]}
         after = self._verified_ids()
@@ -210,9 +221,14 @@ class HierarchicalTeam:
         except Exception:
             return set()
 
-    def run(self, *, survey: dict = None, classes: Iterable[str] = None, total_budget: int = 40) -> TeamResult:
+    def run(self, *, survey: dict = None, classes: Iterable[str] = None, total_budget: int = 40,
+            target: str = None, objective: str = None) -> TeamResult:
         if os.environ.get("AEGIS_TASK_AGENTS", "1") == "0":
             return TeamResult(classes=[], allocation={}, specialists=[])
+        if target:
+            self.target = target
+        if objective:
+            self.objective = objective
         picked = relevant_classes(survey, classes)
         alloc = allocate_budget(picked, total_budget)
         picked = [c for c in picked if c in alloc]      # only funded lanes run
@@ -229,7 +245,9 @@ class HierarchicalTeam:
         else:
             for c in picked:                            # sequential: priority order (relevant_classes sorted)
                 results.append(self._run_specialist(c, alloc[c]))
-        total = sum(len(s.verified) for s in results)
+        # de-dup across specialists: in parallel mode two threads can both observe a finding the other
+        # verified (shared store), so count the UNION of verified ids, never the (over-counting) sum.
+        total = len({fid for s in results for fid in s.verified})
         return TeamResult(classes=picked, allocation=alloc, specialists=results,
                           verified_total=total, parallel=parallel)
 

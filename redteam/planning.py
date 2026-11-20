@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import math
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
@@ -72,9 +73,25 @@ class Plan:
 
 
 def _h(state: State, goal: State) -> int:
-    """Admissible heuristic: number of still-unmet goal facts (each needs >=1 more action). Never
-    overestimates when every action adds at least one fact, so A* with it returns an OPTIMAL plan."""
+    """Count of still-unmet goal facts. Admissible ONLY when each action adds at most one goal fact AND
+    costs >= 1; `plan()` uses the operator-aware `_admissible_h` below (which stays admissible for
+    multi-goal / low-cost operators), so it keeps A*'s optimality guarantee in the general case."""
     return len(goal - state)
+
+
+def _admissible_h(goal: State, max_goal_adds: int, min_cost: float):
+    """Build an operator-aware admissible heuristic: one action adds at most `max_goal_adds` goal facts
+    and costs at least `min_cost`, so reaching `unmet` unmet goals costs >= ceil(unmet/max_goal_adds) *
+    min_cost -- a true lower bound (never an overestimate), unlike the naive unmet-count which overshoots
+    when a single cheap operator grants several goal facts at once."""
+    k = max(1, int(max_goal_adds))
+
+    def _hh(state: State) -> float:
+        unmet = len(goal - state)
+        if unmet <= 0:
+            return 0.0
+        return math.ceil(unmet / k) * min_cost
+    return _hh
 
 
 def plan(init: Iterable[Fact], goal: Iterable[Fact], operators: Iterable[Operator],
@@ -87,8 +104,12 @@ def plan(init: Iterable[Fact], goal: Iterable[Fact], operators: Iterable[Operato
     ops = list(operators)
     if goalf <= start:
         return Plan(actions=[], cost=0.0, goal=goalf, expanded=0)
+    # operator-aware admissible heuristic (keeps A* optimal for multi-goal / low-cost operators)
+    _adds = [len(goalf & o.add) for o in ops if (goalf & o.add)]
+    _costs = [o.cost for o in ops if o.cost > 0]
+    h = _admissible_h(goalf, max(_adds) if _adds else 1, min(_costs) if _costs else 0.0)
     counter = itertools.count()                     # tie-breaker -> stable, avoids comparing states
-    openq = [(_h(start, goalf), 0.0, next(counter), start, [])]
+    openq = [(h(start), 0.0, next(counter), start, [])]
     best = {start: 0.0}
     expanded = 0
     while openq and expanded < max_expansions:
@@ -105,7 +126,7 @@ def plan(init: Iterable[Fact], goal: Iterable[Fact], operators: Iterable[Operato
             ng = g + o.cost
             if ng < best.get(ns, float("inf")):
                 best[ns] = ng
-                heapq.heappush(openq, (ng + _h(ns, goalf), ng, next(counter), ns, acts + [o]))
+                heapq.heappush(openq, (ng + h(ns), ng, next(counter), ns, acts + [o]))
     return Plan(actions=None, cost=float("inf"), goal=goalf, expanded=expanded)
 
 

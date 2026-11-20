@@ -43,6 +43,11 @@ def test_allocation_sums_exact():
     ok(alloc["sqli"] >= alloc["xss"] >= alloc["csrf"], "allocate: higher priority gets >= budget")
     ok(all(v >= 1 for v in alloc.values()), "allocate: every funded lane has a floor of 1")
     ok(ta.allocate_budget([], 10) == {} and ta.allocate_budget(["sqli"], 0) == {}, "allocate: empty/zero -> {}")
+    # budget smaller than the lane count: must fund only the top-priority `total` lanes, never overshoot
+    tight = ta.allocate_budget(["sqli", "xss", "csrf", "ssti", "redirect"], 2)   # 5 lanes, budget 2
+    ok(sum(tight.values()) == 2, "allocate: tight budget never overshoots the cap (%d==2)" % sum(tight.values()))
+    ok(len(tight) == 2 and all(v == 1 for v in tight.values()), "allocate: tight budget funds exactly top-2 lanes @1")
+    ok("sqli" in tight, "allocate: tight budget funds the highest-priority lane first")
 
 
 def test_class_constrained_brainstorm():
@@ -103,6 +108,10 @@ def test_default_specialist_wires_iterativehunt():
                                lambda r: ("rejected", {}), store=store, max_board_rounds=1)
     r = team._default_run_specialist("sqli", 2)
     ok(r.vuln_class == "sqli" and isinstance(r.verified, list), "default specialist: IterativeHunt wired + runs")
+    # REGRESSION GUARD: hunt.run(target, objective) must be called with its required args -- a bare
+    # hunt.run() raises TypeError that the specialist swallows into summary={'error':...} (silent no-op).
+    ok("error" not in (r.summary or {}),
+       "default specialist: hunt.run() got its required args (no swallowed TypeError) -> %r" % (r.summary or {}).get("error"))
 
 
 def test_disabled_switch():

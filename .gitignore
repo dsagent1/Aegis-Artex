@@ -62,3 +62,8 @@ Thumbs.db
 
 # #5: generated persistent attack graph (run data, never committed)
 redteam/attack_graph.json
+
+# runtime telemetry / ledger artifacts (never commit)
+operator/run_heartbeat.json
+operator/run_telemetry.jsonl
+operator/hunt_findings.jsonl

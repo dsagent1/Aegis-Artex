@@ -153,7 +153,13 @@ def replay(artifact_sha256: str, *, override: dict = None, store: "EvidenceStore
     req = dict(ex.get("request", {}))
     if override:
         req.update(override)
-    kwargs = {"headers": req.get("headers") or {}, "verify": verify, "timeout": timeout}
+    headers = dict(req.get("headers") or {})
+    # If the override retargets the host or changes the body, the stored Host / Content-Length belong to
+    # the ORIGINAL exchange and would now be wrong (wrong vhost, mismatched length) -> drop them and let
+    # requests recompute from the actual url+body. Exact replays (and caller-supplied headers) are untouched.
+    if override and ("url" in override or "body" in override) and "headers" not in override:
+        headers = {k: v for k, v in headers.items() if k.lower() not in ("host", "content-length")}
+    kwargs = {"headers": headers, "verify": verify, "timeout": timeout}
     body = req.get("body", "")
     if body:                                           # stored as text -> send verbatim as the body
         kwargs["data"] = body if isinstance(body, str) else json.dumps(body)
