@@ -43,6 +43,24 @@ it faithfully and the finding is confirmed by **reproduction on the copy** (orac
 Because this is the class most breaches actually use, a code-less twin is **high-signal**, not a consolation
 prize for "we didn't get the source."
 
+## Operational value — intrusive testing with no production blast radius
+The deeper value is not only *what* it finds, but *where* it runs. Because every aggressive action lands on
+the isolated local twin, an authorized researcher can:
+- **Run noisy, intrusive, even destructive checks** — exploit attempts, fuzzing, brute force, DoS-adjacent
+  probes — with **zero load, log noise, alerts, WAF triggers, rate-limit lockouts or downtime risk on
+  production**. The real target sees only the earlier passive fingerprint.
+- **Attack autonomously and repeatably** — snapshot → hammer → restore → retry. No human babysitting a live
+  system, no state left behind to clean up, no chance of causing an incident mid-test.
+- **Confirm before prod is ever touched** — a weakness is **reproduced on the copy and oracle-verified**
+  (and, for components, range-matched to the exact deployed version), so what reaches a report is an
+  **evidenced result**, not a scanner's guess. Promoting it to a production claim is then a single low-touch,
+  authorized check (version + exposure match) rather than a noisy live campaign.
+
+In short: the copy absorbs the noise and the risk, so the owner's production stays quiet, stable and
+un-marked while the stack is exercised thoroughly. This is the legitimate, **in-doctrine** form of "test it
+hard without disturbing the real thing" — on **your own authorized target**, you avoid alarming or
+destabilising *your own* production; it is not a means to evade a third party's defences.
+
 ## The honest boundary (what it does NOT establish)
 - **Application-logic bugs** specific to the owner's code — IDOR, broken-authz, business-logic — will **not**
   appear; the scaffold is the stack, not their app. Those need the **real-code mirror** (the high-fidelity
