@@ -84,7 +84,9 @@ Scope is enforced by the `AEGIS_OWNED_DOMAINS` allowlist — owned domains only.
 isolated network; test everything below against it, never prod:
 - **Preferred — a REAL mirror:** actual application **code + config** with **synthetic data** (highest
   fidelity → findings are real). **Fallback — a scaffold reconstruction** from the fingerprint (behavioural,
-  low fidelity, e.g. a legacy PHP app) — good for known-CVE/protocol, weak for code-logic.
+  low fidelity, e.g. a legacy PHP app) — good for known-CVE/protocol, weak for code-logic. **See
+  `STACK_MIRROR.md`** for the code-less stack-mirror-and-probe approach, what it legitimately finds, and its
+  honest boundary (stack/component weaknesses yes; bespoke app-logic no → production candidates).
 - **Snapshot the baseline** (reset between episodes / after write-heavy tests).
 - **Validate fidelity (v3):** run a fidelity test-set (known-good behaviours the real target exhibits) and
   **record measured divergence** — so stage 6 judges a non-firing CVE against real drift, not assumption.
