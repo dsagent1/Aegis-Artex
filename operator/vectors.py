@@ -99,6 +99,57 @@ def recon(move, ctx):
     return {"status": 200, "body": out[:4000]}
 
 
+def _osv_deps(move, ctx):
+    """Collect (ecosystem, name, version) triples to range-match against OSV. Sources, first non-empty:
+    move['deps'], ctx['deps'], ctx['manifest']['deps'] -- each a list of {ecosystem,name,version} dicts
+    (aliases eco/package/pkg/ver accepted) or [eco, name, ver] triples. Incomplete entries are skipped."""
+    raw = ((move or {}).get("deps") or (ctx or {}).get("deps")
+           or ((ctx or {}).get("manifest") or {}).get("deps") or [])
+    out = []
+    for d in raw:
+        if isinstance(d, dict):
+            eco = d.get("ecosystem") or d.get("eco") or ""
+            name = d.get("name") or d.get("package") or d.get("pkg") or ""
+            ver = d.get("version") or d.get("ver") or ""
+        elif isinstance(d, (list, tuple)) and len(d) >= 3:
+            eco, name, ver = d[0], d[1], d[2]
+        else:
+            continue
+        if eco and name and ver:
+            out.append((str(eco), str(name), str(ver)))
+    return out
+
+
+def _osv_pass(move, ctx):
+    """COVERAGE engine: range-precise dependency/plugin advisories via OSV.dev -- the NO-IMAGE, black-box
+    lane (detected deps from the fingerprint / SBOM / an exposed manifest), complementing the grype image
+    scan. OSV range-matches the version server-side, so a patched version is not false-flagged. Offline-safe
+    (never raises), gated AEGIS_OSV=0. Returns a list of per-package advisory hits, or None."""
+    if os.environ.get("AEGIS_OSV", "1") == "0":
+        return None
+    deps = _osv_deps(move, ctx)
+    if not deps:
+        return None
+    try:
+        import osv_lookup
+    except Exception:
+        try:
+            import sys as _sys
+            _rag = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rag")
+            if _rag not in _sys.path:
+                _sys.path.insert(0, _rag)
+            import osv_lookup
+        except Exception:
+            return None
+    try:
+        hits = osv_lookup.scan_manifest(deps)
+    except Exception:
+        return None
+    out = [{"ecosystem": e, "name": n, "version": v, "advisories": adv, "count": len(adv)}
+           for (e, n, v), adv in hits.items()]
+    return out or None
+
+
 def supply_chain(move, ctx):
     from supply_chain_scan import scan_image
     # SCAFFOLD direction: scan the STACK image for vulnerable deps. If the seed didn't name an image,
@@ -118,7 +169,20 @@ def supply_chain(move, ctx):
             res = confirm_all(res, base=(ctx or {}).get("base"))
         except Exception:
             pass
-    return {"status": 200, "supply_chain": res, "body": f"{res.get('count', 0)} HIGH/CRITICAL deps"}
+    body = f"{res.get('count', 0)} HIGH/CRITICAL deps"
+    out = {"status": 200, "supply_chain": res, "body": body}
+    # NO-IMAGE lane: range-precise dependency/plugin advisories via OSV on the FINGERPRINTED deps
+    # (complements the grype image scan; both feed the same oracle). Additive + offline-safe.
+    osv = _osv_pass(move, ctx)
+    if osv:
+        n_adv = sum(d["count"] for d in osv)
+        res["osv"] = osv
+        res["osv_count"] = n_adv
+        out["osv"] = osv
+        out["body"] = body + f" + {n_adv} OSV dependency advisory(ies) on {len(osv)} package(s)"
+        if n_adv:
+            out["status"] = 300   # leads found (same convention as the nuclei leg)
+    return out
 
 
 def static(move, ctx):
