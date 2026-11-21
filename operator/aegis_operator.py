@@ -1079,6 +1079,42 @@ def _driver_banner(current_label):
     return ("Driving model (switch live):  " + "  ".join(parts)
             + "  |  /brain cycles  |  current=" + current_label)
 
+def _chat_plan(line):
+    """/plan <objective> --target <host-or-url> [--scenarios N] [--role owner] -- the deterministic PLANNER
+    front door (no model turn). Runs operator/planner.py and prints the fingerprint + ranked techniques +
+    NOVEL approaches + numbered scenarios, so the operator (or DS) picks a scenario to run instead of the
+    brain improvising its own plan. Flags after the objective pass straight through to planner.py."""
+    try:
+        import shlex; toks = shlex.split(line.strip())
+    except Exception:
+        toks = line.strip().split()
+    toks = toks[1:]                                   # drop '/plan'
+    obj_parts = []; i = 0
+    while i < len(toks) and not toks[i].startswith("--"):
+        obj_parts.append(toks[i]); i += 1
+    rest = toks[i:]; objective = " ".join(obj_parts).strip()
+    if not objective or "--target" not in rest:
+        _emit("PLAN", "usage: /plan <objective> --target <host-or-url> [--scenarios 3] [--roles owner]",
+              to_stdout=True); return
+    if "--scenarios" not in rest:
+        rest += ["--scenarios", "3"]
+    here = os.path.dirname(os.path.abspath(__file__))
+    cmd = [sys.executable, os.path.join(here, "planner.py"), objective] + rest
+    _emit("PLAN", "running the Planner (no model turn): " + " ".join(cmd[2:]), to_stdout=True)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=300, cwd=here, stdin=subprocess.DEVNULL)
+    except Exception as e:
+        _emit("PLAN", f"planner failed to start: {repr(e)[:160]}", to_stdout=True); return
+    if (p.stdout or "").strip():
+        _slowcat(p.stdout.strip() + "\n")
+    if p.returncode != 0:
+        _emit("PLAN", f"planner exited rc={p.returncode}"
+              + (f": {(p.stderr or '').strip()[-300:]}" if (p.stderr or '').strip() else ""), to_stdout=True)
+    else:
+        _emit("PLAN", "plan ready -- tell DS which scenario to run (e.g. 'run the thorough scenario'), or "
+              "ask it to hunt and the loop seeds itself from this plan.", to_stdout=True)
+
 def _handle_control(line, gate):
     """Return 'exit' | 'stop' | 'handled' | None. Shared by the REPL and the mid-task queue drain."""
     low = (line or "").strip().lower()
@@ -1108,6 +1144,8 @@ def _handle_control(line, gate):
         _chat_compact(fold=("keep" not in low)); return "handled"
     if _cmd0 in ("/resume", "/load"):   # load the saved session on demand (pickup w/o restart)
         _chat_resume(); return "handled"
+    if _cmd0 in ("/plan",):   # deterministic PLANNER front door: /plan <objective> --target <t> [--scenarios N]
+        _chat_plan(line); return "handled"   # original line (not low) to preserve objective/target case
     if _cmd0 in ("/search", "/find", "/grep"):   # find text across this chat (case-insensitive)
         parts = line.strip().split(maxsplit=1)   # use original line to keep the search term's case
         _chat_search(parts[1] if len(parts) > 1 else ""); return "handled"
@@ -1483,6 +1521,25 @@ def t_submit(description, abstract="Task", verification="Task completed."):
                       "description": description, "verification": verification}, timeout=30)
     r.raise_for_status()
     return json.dumps({"task_id": r.json().get("task_id")})
+
+def t_plan(objective, target, scenarios=3, roles=None, surfaces=None, stack=None):
+    """Run the strategic PLANNER (operator/planner.py) for an objective+target. Returns the target
+    fingerprint, RANKED prior-successful (technique, tool) combos, NOVEL board approaches, and numbered
+    candidate scenarios (fast-track/thorough/covert). Read-only PREVIEW -- it does NOT execute; pick a
+    scenario then launch the hunt (iterative_hunt_live.py) to run it. Prefer this over improvising a plan."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cmd = [sys.executable, os.path.join(here, "planner.py"), str(objective),
+           "--target", str(target), "--scenarios", str(int(scenarios or 3))]
+    for flag, val in (("--roles", roles), ("--surfaces", surfaces), ("--stack", stack)):
+        if val:
+            cmd.append(flag); cmd += (val if isinstance(val, list) else [str(val)])
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=300, cwd=here, stdin=subprocess.DEVNULL)
+    except Exception as e:
+        return json.dumps({"ok": False, "error": repr(e)[:200]})
+    return json.dumps({"ok": p.returncode == 0, "rc": p.returncode,
+                       "plan": (p.stdout or "")[-6000:], "stderr": (p.stderr or "")[-600:]})
 
 def t_resume(task_id, note=""):
     cmd = [sys.executable, CLI, "resume", task_id] + (["--note", note] if note else [])
@@ -3052,6 +3109,18 @@ TOOLS = {
     "Submit a NEW scoped aegis pentest task. Returns task_id.",
     {"description": {"type": "string"}, "abstract": {"type": "string"}, "verification": {"type": "string"}},
     ["description"])),
+ "plan_task": (t_plan, True, _spec("plan_task",
+    "Run the strategic PLANNER for an engagement objective against a target. Returns the fingerprint, RANKED "
+    "prior-successful techniques, NOVEL approaches, and numbered candidate scenarios (fast-track/thorough/"
+    "covert). Read-only PREVIEW -- it does not execute. PREFER this over improvising your own plan for a "
+    "pentest task; then launch the hunt (run_background: python operator/iterative_hunt_live.py --objective "
+    "... --role owner --budget 40, which seeds itself from the Planner) to run the chosen scenario. SKIP it "
+    "only if the operator told you to work on your own / not plan.",
+    {"objective": {"type": "string"}, "target": {"type": "string"}, "scenarios": {"type": "integer"},
+     "roles": {"type": "array", "items": {"type": "string"}},
+     "surfaces": {"type": "array", "items": {"type": "string"}},
+     "stack": {"type": "array", "items": {"type": "string"}}},
+    ["objective", "target"])),
  "resume_task": (t_resume, False, _spec("resume_task",
     "Plain resume-nudge a stalled/interrupted task (no VPN change).",
     {"task_id": {"type": "string"}, "note": {"type": "string"}}, ["task_id"])),
@@ -3683,11 +3752,30 @@ def _identity_preface():
             "DeepSeek, Claude, GPT, etc. unless that is your current model above). The operator can hot-swap "
             "your underlying model mid-chat; always report your CURRENT one, not a default.\n")
 
+def _brevity_preface():
+    """Verbosity governor for the chat PROSE channel. Chatty flash brains (ds-cf = deepseek-v4.1-flash)
+    restate the question, recap what they just did, and wrap answers in preamble/summary; the pro brains
+    don't. Rebuilt with the system prompt on every live /brain swap, so it auto-engages when you /ds-cf and
+    lifts when you /ds. Tunable via AEGIS_CHAT_BREVITY: 0 = off, 1 = flash/CF brains only (default),
+    2 = all brains. Governs plain-text replies only -- tool calls are untouched."""
+    lvl = os.environ.get("AEGIS_CHAT_BREVITY", "1")
+    if lvl == "0":
+        return ""
+    brain = (_CTX.get("brain") or "").lower()
+    model = (_CTX.get("model") or "").lower()
+    flashy = ("cf" in brain) or ("flash" in brain) or ("flash" in model) or ("@cf/" in model)
+    if lvl != "2" and not flashy:
+        return ""
+    return ("\n\nBREVITY (prose only): keep every plain-text reply SHORT -- a few lines at most. Do NOT "
+            "restate or paraphrase the operator's question, do NOT recap what you just did, and do NOT add a "
+            "preamble or a closing summary. Lead with the answer/result and stop; drop filler. This governs "
+            "prose replies ONLY -- it never shortens or suppresses a tool call.\n")
+
 def _build_chat_system():
-    """Compose the full chat system prompt from the current context (identity + doctrine + skill + addendum
-    + mode policy + memory + ledger). Rebuilt at chat start and on every live brain swap."""
-    return (SYSTEM + _identity_preface() + _DOCTRINE + _skill_preface() + CHAT_SYSTEM_ADDENDUM
-            + _mode_policy(TARGET_MODE) + _memory_preface() + _ledger_block())
+    """Compose the full chat system prompt from the current context (identity + brevity + doctrine + skill +
+    addendum + mode policy + memory + ledger). Rebuilt at chat start and on every live brain swap."""
+    return (SYSTEM + _identity_preface() + _brevity_preface() + _DOCTRINE + _skill_preface()
+            + CHAT_SYSTEM_ADDENDUM + _mode_policy(TARGET_MODE) + _memory_preface() + _ledger_block())
 
 _CTX = {}  # shared agent context (client/model/thinking/gate/depth) for sub-agents
 
@@ -4456,6 +4544,15 @@ a result: poll read_task_context, watch checkpoint-mtime for real progress, catc
 hung processes, resume or VPN-rotate per doctrine, and report back. For code, use the debug-fix loop
 (edit -> auto-verify -> run -> revert if worse) and run_background for anything long-running. Use
 write_todos to track multi-step work; it and the conversation persist across the session.
+
+PLANNER-FIRST (engagement tasks): for a pentest objective against a target, do NOT improvise your own
+plan. Run the PLANNER first -- call plan_task (or use the operator's /plan output if they already ran it) --
+to get the fingerprint, RANKED prior-successful techniques, NOVEL approaches, and numbered scenarios
+(fast-track/thorough/covert). Pick a scenario, then launch the hunt (run_background: python
+operator/iterative_hunt_live.py --objective "..." --role owner --budget 40, which seeds itself from the
+Planner). EXCEPTION -- the operator ALWAYS overrides this: if they say "work on your own", "skip the
+planner", "don't plan", or just "go", do exactly that and plan nothing. This applies only to engagement
+tasks, not to code/ops/chat questions.
 
 TURN DISCIPLINE -- READ CAREFULLY (this is how control flow works here):
 A plain-text message with NO tool call ENDS your turn and hands control back to the operator, who
