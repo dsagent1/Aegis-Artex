@@ -558,6 +558,44 @@ def _salvage_tooltext(content, allowed):
     return calls or None
 
 
+def _attempted_tool_names(content):
+    """Names of any tool-call-SHAPED objects a model PRINTED as text, regardless of whether that tool exists
+    or is allowed here -- so the loop can tell 'the model TRIED to call a tool (that we don't have)' from an
+    ordinary conversational reply. Mirrors _salvage_tooltext's balanced-brace parse but without the allow-list
+    filter; gated by the same _FUNC_HINT so prose is never mistaken for a call. Never raises. Returns a list
+    of attempted names (possibly empty)."""
+    t = (content or "").strip()
+    if not t or "{" not in t or not _FUNC_HINT.search(t):
+        return []
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t).strip()
+    names, i = [], 0
+    while i < len(t):
+        if t[i] != "{":
+            i += 1; continue
+        depth = 0; j = i; in_str = False; esc = False
+        while j < len(t):
+            c = t[j]
+            if esc: esc = False
+            elif c == "\\": esc = True
+            elif c == '"': in_str = not in_str
+            elif not in_str and c == "{": depth += 1
+            elif not in_str and c == "}":
+                depth -= 1
+                if depth == 0:
+                    j += 1; break
+            j += 1
+        chunk = t[i:j]
+        try: obj = json.loads(chunk)
+        except Exception: obj = _repair_args_json(chunk) or None
+        if isinstance(obj, dict):
+            fnobj = obj.get("function") if isinstance(obj.get("function"), dict) else {}
+            nm = obj.get("name") or fnobj.get("name")
+            if isinstance(nm, str) and nm.strip():
+                names.append(nm.strip())
+        i = j if j > i else i + 1
+    return names
+
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Optional external task-tree scheduler (see orchestrator/). The harness runs fully
 # standalone without it (direct tool-loop + planner_core); the scheduler tools simply
@@ -3897,6 +3935,8 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
     _autocont = 0
     _autocont_on = chat and os.environ.get("AEGIS_CHAT_AUTOCONTINUE", "1") != "0"
     _autocont_max = int(os.environ.get("AEGIS_CHAT_AUTOCONTINUE_MAX", "3"))
+    _empty_streak = 0   # consecutive fully-empty turns (even after brain-escalation) -> bounded hand-back
+    _EMPTY_STREAK_MAX = int(os.environ.get("AEGIS_EMPTY_STREAK_MAX", "3"))
     # token budgets -- TUNED so thinking is NOT starved (reasoning eats the budget -> empty content otherwise)
     # budgets TUNED from the sweet-spot sweep (MD5 length-extension probe):
     _base_max = int(os.environ.get("AEGIS_MAX_TOKENS", "3000"))          # flash needed ~1.6k on hard tasks -> 1600 truncated; 3k safe+cheap
@@ -4041,8 +4081,48 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                         _p(f"{tag} #{i}] ", end="", flush=True); _slowcat(msg.content + "\n")
                     break
             else:
-                _emit("STEP", f"{cur_model} returned empty {_EMPTY_MAX}x (stream+non-stream) -- giving up this turn",
-                      to_stdout=not quiet)
+                # EMPTY persisted across retries -> do NOT give up the turn. ESCALATE the driving brain
+                # (flash -> pro -> gpt-oss), or swap to AEGIS_EMPTY_FALLBACK_MODEL when off-ladder/at the top,
+                # and retry THIS turn once; if that STILL yields nothing, keep the turn ALIVE with a nudge.
+                # Bounded by _empty_streak so a brain that only ever returns empty can't spin the whole budget --
+                # then it hands back INFORMED (switch model / simplify), never a silent give-up.
+                # AEGIS_EMPTY_ESCALATE=0 disables the brain swap (still keeps the turn alive via the nudge).
+                _new = None
+                if os.environ.get("AEGIS_EMPTY_ESCALATE", "1") != "0":
+                    if 0 <= _esc_i < len(_BRAIN_LADDER) - 1:
+                        _esc_i += 1; _new = _BRAIN_LADDER[_esc_i]
+                    else:
+                        _fb = os.environ.get("AEGIS_EMPTY_FALLBACK_MODEL", "").strip()
+                        if _fb and _fb != cur_model:
+                            _new = _fb
+                if _new:
+                    cur_model = _new; kw["model"] = cur_model
+                    _emit("STEP", f"empty {_EMPTY_MAX}x from the brain -> ESCALATED to {cur_model}, retrying this turn",
+                          to_stdout=not quiet)
+                    _p(f"{tag} [escalate] empty replies -> brain {cur_model}\n", flush=True)
+                    try:
+                        _resp = _create(client, **kw); msg = _resp.choices[0].message
+                        if msg.content and not quiet:
+                            _p(f"{tag} #{i}] ", end="", flush=True); _slowcat(msg.content + "\n")
+                    except Exception as _e:
+                        _emit("STEP", f"escalated retry errored: {repr(_e)[:100]}", to_stdout=False)
+                if not ((msg.content and str(msg.content).strip()) or msg.tool_calls):
+                    _empty_streak += 1
+                    if _empty_streak >= _EMPTY_STREAK_MAX:
+                        _emit("STEP", f"brain returned empty {_empty_streak} turns running (escalation exhausted) "
+                              "-- handing back so the operator can switch model / simplify", to_stdout=not quiet)
+                        _p(f"{tag} [empty] the brain keeps returning nothing -- switch model (e.g. --provider / a "
+                           "non-reasoning brain) or simplify the request, then say 'continue'.\n", flush=True)
+                        return None
+                    _emit("STEP", f"{cur_model} still empty -- nudging to continue (turn kept alive "
+                          f"{_empty_streak}/{_EMPTY_STREAK_MAX})", to_stdout=not quiet)
+                    messages.append({"role": "user", "content":
+                        "Your last reply came back EMPTY (no text and no tool call). Do not stop -- issue a "
+                        "concrete NEXT tool call now, or end with a question if you need an operator decision, "
+                        "or call finish() if the task is genuinely complete."})
+                    continue
+        if (msg.content and str(msg.content).strip()) or msg.tool_calls:
+            _empty_streak = 0   # a productive turn clears the empty streak
         # SALVAGE: CF scout (and kin) often PRINT a tool call as JSON text instead of emitting a real
         # tool_call. If a turn has no tool_calls but its content is actually a function-call object for an
         # allowed tool, convert it into genuine tool_call(s) so the step executes instead of dumping JSON.
@@ -4081,6 +4161,50 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                         "continue, or call finish() if it is genuinely complete. (If you actually need an "
                         "operator decision, end your message with a question and I will hand control back.)"})
                     continue
+                # MISSING-TOOL RECOVERY: the model tried to call a tool that is NOT available here (named in
+                # text, so salvage couldn't execute it). A phantom tool must NEVER stop the task. Policy: keep
+                # going and resolve it -- INSTALL the missing tool (install_kali_tool runs under the approval
+                # gate: auto-approve installs it automatically = "auto mode"; 'ask' mode prompts the operator =
+                # "ask to install"), USE an available tool / a different approach (= "move past"), or ASK the
+                # operator. Bounded by the auto-continue budget; skipped on a real trailing question.
+                _miss = [n for n in _attempted_tool_names(_reply_txt) if n not in allowed_names]
+                if _miss and not _reply_txt.endswith("?"):
+                    _names = ", ".join(dict.fromkeys(_miss))
+                    _can_install = "install_kali_tool" in allowed_names
+                    _auto = _can_install and getattr(gate, "mode", "ask") != "ask"
+                    if _autocont_on and _autocont < _autocont_max:
+                        _autocont += 1
+                        _emit("STEP", f"auto-continue {_autocont}/{_autocont_max}: model tried UNAVAILABLE "
+                              f"tool(s) {_names} -- {'auto-install' if _auto else 'install/redirect/ask'} nudge "
+                              "(NOT stopping)", to_stdout=not quiet)
+                        if _auto:
+                            _instr = (f"`{_names}` is NOT an available tool, so nothing ran -- and that is not a "
+                                      "reason to stop. Auto-approve is ON: if it is a Kali/CLI tool, call "
+                                      "install_kali_tool to add it NOW and then use it; otherwise use one of the "
+                                      "tools you DO have or a different approach. Issue a REAL tool call now (only "
+                                      "call finish() if the task is genuinely complete).")
+                        elif _can_install:
+                            _instr = (f"`{_names}` is NOT an available tool, so nothing ran -- do not stop. Choose "
+                                      "ONE: (a) if you need that Kali/CLI tool, call install_kali_tool to add it "
+                                      "(the operator approves the install); (b) use a tool you DO have, or a "
+                                      "different approach; (c) if you truly need an operator decision, end your "
+                                      "next message with a question. Issue a REAL tool call now.")
+                        else:
+                            _instr = (f"`{_names}` is NOT an available tool, so nothing ran -- do not stop. Use a "
+                                      "tool you DO have or a different approach; or, if you genuinely need that "
+                                      "tool or an operator decision, end your next message with a question so I "
+                                      "can add it or redirect you. Issue a REAL tool call now.")
+                        messages.append({"role": "user", "content": _instr})
+                        continue
+                    # Budget spent on the same phantom tool -> INFORMED hand-back (the 'ask the operator'
+                    # fallback), never a silent stop: name the missing tool + the options so the operator can
+                    # install it or redirect the task.
+                    _emit("STEP", f"handing back: model kept trying unavailable tool(s) {_names} after "
+                          f"{_autocont_max} nudges -- install it or redirect the task", to_stdout=not quiet)
+                    _p(f"{tag} [needs tool] {_names} is not available here -- install it"
+                       + (" (install_kali_tool)" if _can_install else "") + " or pick another approach, then "
+                       "say 'continue'.\n", flush=True)
+                    return None
                 return None  # genuine hand-back: a question, no open plan, or auto-continue budget spent
             messages.append({"role": "user", "content": "Continue: take the next action, or call finish()."})
             continue
