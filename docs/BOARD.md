@@ -13,7 +13,7 @@ tuning so another agent can drive/extend it. Source of truth in code: `operator/
 - **code-WRITER roster** — the ordered bake-off-tuned writers the live novel-code driver rotates through.
 
 ## Providers & credentials (secrets in `ask-board/secret.env`, gitignored)
-- **DeepSeek direct** (`api.deepseek.com`, `DEEPSEEK_API_KEY`) — `ds` = deepseek-v4-pro (writer/coder), `deepseek-v4-flash` (board chat, `AEGIS_BOARD_MODEL`). Reliable; billed separately.
+- **DeepSeek direct** (`api.deepseek.com`, `DEEPSEEK_API_KEY`) — `ds` = deepseek-v4-pro (writer/coder), `deepseek-v4-flash` (board chat, `AEGIS_BOARD_MODEL`). Reliable; billed separately. **CF failover:** if the direct API fails — most often **HTTP 402** (account out of credit), or 410/429/empty — the `ds` code-bench seat auto-fails-over to DeepSeek flash on Cloudflare Workers-AI (`deepseek-cf` = `@cf/deepseek-ai/deepseek-v4.1-flash-1017`) so the seat never goes dark when direct DeepSeek is unfunded (generous token floor + retry + a `qwen2.5-coder` last resort). See `AEGIS_DS_CF_FAILOVER` below.
 - **Cloudflare Workers-AI** (CF creds, spends Neurons) — all `@cf/...` models (slugs in `cf_models.json`). Any 403/absent model skips gracefully.
 - **Claude** — the coordinator answers DIRECTLY via `board_ask --claude "<take>"` (NO API key); as a code WRITER it's the `claude -p` CLI (`AEGIS_CLAUDE_BENCH_MODEL=claude-sonnet-5`, haiku fallback).
 
@@ -38,6 +38,7 @@ tuning so another agent can drive/extend it. Source of truth in code: `operator/
 
 **Global tuning knobs:**
 - **`AEGIS_DS_THINKING`** (default 0) — DeepSeek + reasoning models send `thinking:{type:disabled}`; else `content` returns empty and raw `reasoning_content` leaks. Set 1 only if a model needs reasoning on.
+- **`AEGIS_DS_CF_FAILOVER`** (default 1) — on a direct-DeepSeek failure (402 no-credit / 410 / 429 / empty), the `ds` coder fails over to `deepseek-cf` (CF flash). Token floor `AEGIS_DS_CF_TOKENS` (default 2000, since flash still "thinks" under the code role) + a `qwen2.5-coder` last resort. Set 0 to disable the failover.
 - **temperature** ~0.3 (review) / ~0.4 (code-gen) — low, near-deterministic.
 - **`AEGIS_CF_TIMEOUT`** — per-member hard timeout; reasoning models (qwq/r1) run 4-8s, longer under load → bound it.
 - **`AEGIS_NOVEL_CODE=0`** — skip the code-bench for latency-sensitive runs.

@@ -74,6 +74,38 @@ objective + target  ──►  PLANNER  ──►  ranked plan (seed_moves)  ─
   completed) + `plan_steps` (technique, tool, order, attempt-budget, outcome) so re-opens + write-backs
   are auditable.
 
+## Approach-yield benchmark — the T0 selector (`operator/t0_bandit.py`)
+Complementing the Planner's prior-success ranking, a **UCB1 bandit over technique-CLASSES** answers one
+question cheaply — *"which approach is worth trying next?"* — from observed reward, so the loop spends
+budget where confirms actually come from instead of polling the board every round. Deterministic-first,
+pure/offline/no-LLM; the board stays the stall-breaker. Wired into `iterative_hunt` + `iterative_hunt_live`.
+
+- **Reward = viable-finding yield.** An oracle-**verified** confirm → `1.0`, scaled up to **×1.6** on
+  high-impact surfaces (money/auth/egress/exfil); an info-gaining **clean** refutation → `0.15` (you learned
+  the surface is guarded); noise/404 → `0`. UCB1's exploration term keeps under-tried classes in play.
+  State `{arm: {n, reward_sum}}` is persisted to `rag/bandit_state.json` and **accumulated across runs**, fed
+  from the loop's verdict stream (`learn_from_context`). `select(k)` returns the top-k arms; `mean = reward_sum/n`
+  is the yield.
+- **Canonical arms.** `_canon()` merges synonym spellings (`mass-assignment`/`mass_assignment`,
+  `ssrf`/`server-side-request-forgery`, `broken-object-level-authz`/`idor`, the `info_disclosure` variants)
+  onto one canonical arm so a split spelling never dilutes the yield signal; **compound** arms (e.g.
+  `idempotency+race`) are preserved. One-time cleanup of an existing state: `--normalize` (sums counts, keeps a
+  `.pre-normalize.bak`).
+- **Per-SPECIFIC-approach yield (`SigYield`).** A finer companion store keyed by `(class, normalized
+  surface+param, mechanism, method, oracle-signal)` → `rag/sig_yield.json`, fed from the same verdict stream,
+  so you can see WHICH concrete approach yields — not just which family. It separates a confirmed
+  `authz @ /rest/basket/{id}` (IDOR) from a rejected `authz @ /api/Users` that the family arm lumps together.
+  Gate `AEGIS_SIG_YIELD=0`.
+- **Inspect it (read-only):**
+  ```
+  python operator/t0_bandit.py --report [--top N]   # yield per approach-CLASS, best-first
+  python operator/t0_bandit.py --sigs   [--top N]   # yield per SPECIFIC approach (class @ surface [mech])
+  python operator/t0_bandit.py --normalize          # one-time: merge synonym arms (keeps a backup)
+  ```
+- **Run-scoped steer (opt-in, never persisted).** `AEGIS_PRIORITY` (`trust_chain` / `novel_code` / `balanced`)
+  biases selection toward a family set and splits parallel agents across directions, without poisoning the
+  learned means.
+
 ## Guardrails (unchanged)
 `planner_core`'s hard bounds (node ceiling + wall-clock); the authorization / non-destructive doctrine;
 MITRE egress **offline-safe + VPN-gated** (identical to the CVE refresh). ATT&CK data is *reference* —
