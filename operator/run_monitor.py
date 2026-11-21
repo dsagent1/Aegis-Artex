@@ -211,7 +211,9 @@ def _fold_ledger(path):
         rec["traffic_count"] = len(shas)
         if grade_poe:
             oids = confirms.get(fid, set())
-            rec["poe"] = grade_poe(rec.get("status"), len(oids), high_confidence_oracle(oids), len(shas))
+            qv = any(isinstance(e, dict) and e.get("quote_ok") for e in ev_by_fid.get(fid, []))
+            rec["quote_verified"] = qv
+            rec["poe"] = grade_poe(rec.get("status"), len(oids), high_confidence_oracle(oids), len(shas), qv)
             _st = set(verdicts.get(fid, {}).values())
             rec["disagreement"] = ("verified" in _st and bool(_st - {"verified"}))
             rec["confidence"] = grade_confidence(rec.get("status"), len(oids), high_confidence_oracle(oids),

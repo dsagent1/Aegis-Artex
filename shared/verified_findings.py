@@ -57,6 +57,11 @@ class Evidence:
     status: int = 0           # response status code (0 = n/a)
     req_len: int = 0          # request body length (chars)
     resp_len: int = 0         # response body length (chars)
+    # --- ARTEX-port A1 EXTENSION: verbatim evidence quote. `quote` is the exact substring of the
+    # (decompressed) response that PROVES the finding; `quote_ok` is whether it was actually present in
+    # the captured body at capture time. Both default-empty/False -> fully backward-compatible. ---
+    quote: str = ""           # the proving substring (verbatim)
+    quote_ok: bool = False     # the quote was found in the captured (decoded) response body
 
 @dataclass
 class Finding:
@@ -113,6 +118,47 @@ class EvidenceStore:
     def has(self, sha: str) -> bool:
         return bool(sha) and os.path.exists(self._file(sha))
 
+def _decode_body(body, headers=None) -> str:
+    """ARTEX-port A1 EXTENSION: return the body as decoded TEXT, decompressing gzip/deflate/brotli when a
+    Content-Encoding header says so (ARTEX decodes before any quote check). `requests.Response.text` is
+    already decoded, so this matters for RAW/byte captures from direct callers. Always best-effort: on any
+    failure it returns the body as-is (decoded utf-8 if bytes), never raising into capture."""
+    if body is None:
+        return ""
+    enc = ""
+    for k, v in (headers or {}).items():
+        if str(k).lower() == "content-encoding":
+            enc = str(v).lower().strip(); break
+    raw = body if isinstance(body, (bytes, bytearray)) else None
+    if raw is not None and enc:
+        try:
+            if "gzip" in enc:
+                import gzip; raw = gzip.decompress(bytes(raw))
+            elif "deflate" in enc:
+                import zlib
+                try:
+                    raw = zlib.decompress(bytes(raw))
+                except zlib.error:
+                    raw = zlib.decompress(bytes(raw), -zlib.MAX_WBITS)   # raw deflate
+            elif "br" in enc:
+                import brotli; raw = brotli.decompress(bytes(raw))       # optional dep
+        except Exception:
+            pass
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw).decode("utf-8", "replace")
+    if isinstance(body, (bytes, bytearray)):
+        return bytes(body).decode("utf-8", "replace")
+    return body
+
+
+def verify_quote(evidence: dict, response_text: str) -> bool:
+    """ARTEX-port A1 EXTENSION: does the finding's bound verbatim quote still appear in `response_text`?
+    Used by retest to confirm a proof's exact signature survives on replay. No quote recorded -> None-safe
+    False (nothing to re-check)."""
+    q = (evidence or {}).get("quote") or ""
+    return bool(q) and q in (response_text or "")
+
+
 def _exchange(method, url, req_headers, req_body, status, resp_headers, resp_body) -> dict:
     return {"request": {"method": (method or "").upper(), "url": url or "",
                         "headers": dict(req_headers or {}), "body": req_body if req_body is not None else ""},
@@ -120,10 +166,13 @@ def _exchange(method, url, req_headers, req_body, status, resp_headers, resp_bod
                          "body": resp_body if resp_body is not None else ""}}
 
 def capture_exchange(*, method, url, req_headers=None, req_body="", status=0, resp_headers=None,
-                     resp_body="", role="proof", detail="", tool_call_id="",
+                     resp_body="", role="proof", detail="", tool_call_id="", quote="",
                      store: "EvidenceStore" = None) -> Evidence:
     """Persist a full HTTP exchange and return a role-tagged Evidence whose artifact_sha256 is POPULATED
-    (the field that was historically always empty). Reuses _sha256 via EvidenceStore. ARTEX-port A1."""
+    (the field that was historically always empty). Reuses _sha256 via EvidenceStore. ARTEX-port A1.
+    A1 EXTENSION: the response body is DECODED (gzip/deflate/br) before storage, and if a verbatim `quote`
+    is supplied it is checked against the decoded body and recorded (quote_ok) as the finding's proof
+    signature -- so retest can confirm the exact string survives."""
     if role not in VALID_ROLE:
         raise ValueError(f"invalid evidence role {role!r} (not in {sorted(VALID_ROLE)})")
     headers = dict(req_headers or {})
@@ -132,13 +181,15 @@ def capture_exchange(*, method, url, req_headers=None, req_body="", status=0, re
         headers.setdefault("Content-Type", "application/json")
     else:
         body_req = req_body if req_body is not None else ""
+    resp_text = _decode_body(resp_body, resp_headers)  # decode BEFORE storing + the quote check
+    q_ok = bool(quote) and quote in resp_text
     st = store or EvidenceStore()
-    sha = st.put(_exchange(method, url, headers, body_req, status, resp_headers, resp_body))
-    resp_body = resp_body if resp_body is not None else ""
+    sha = st.put(_exchange(method, url, headers, body_req, status, resp_headers, resp_text))
     return Evidence(kind="http", detail=(detail or f"{(method or '').upper()} {url} -> {status}"),
                     artifact_sha256=sha, tool_call_id=tool_call_id, role=role, url=url or "",
                     method=(method or "").upper(), status=int(status or 0),
-                    req_len=len(body_req or ""), resp_len=len(resp_body))
+                    req_len=len(body_req or ""), resp_len=len(resp_text),
+                    quote=quote or "", quote_ok=q_ok)
 
 def replay(artifact_sha256: str, *, override: dict = None, store: "EvidenceStore" = None,
            timeout: float = 25, verify: bool = False):
@@ -165,10 +216,11 @@ def replay(artifact_sha256: str, *, override: dict = None, store: "EvidenceStore
         kwargs["data"] = body if isinstance(body, str) else json.dumps(body)
     return requests.request(req.get("method", "GET"), req.get("url", ""), **kwargs)
 
-def _maybe_capture(resp, role, *, store: "EvidenceStore" = None):
+def _maybe_capture(resp, role, *, quote="", store: "EvidenceStore" = None):
     """Capture a live requests.Response (and the exact request it carries) into the evidence store, if
     enabled. Returns an Evidence-as-dict or None. NEVER raises into an oracle -- a capture failure or a
-    missing `requests` must not abort a hunt. Kill-switch: AEGIS_CAPTURE_EVIDENCE=0."""
+    missing `requests` must not abort a hunt. Kill-switch: AEGIS_CAPTURE_EVIDENCE=0. A1 EXTENSION: an
+    optional verbatim `quote` is bound as the finding's proof signature (resp.text is already decoded)."""
     if os.environ.get("AEGIS_CAPTURE_EVIDENCE", "1") == "0" or resp is None:
         return None
     try:
@@ -180,7 +232,8 @@ def _maybe_capture(resp, role, *, store: "EvidenceStore" = None):
                               req_headers=dict(getattr(rq, "headers", {}) or {}), req_body=req_body,
                               status=getattr(resp, "status_code", 0),
                               resp_headers=dict(getattr(resp, "headers", {}) or {}),
-                              resp_body=(getattr(resp, "text", "") or ""), role=role, store=store)
+                              resp_body=(getattr(resp, "text", "") or ""), role=role, quote=quote,
+                              store=store)
         return asdict(ev)
     except Exception:
         return None
@@ -216,17 +269,22 @@ def high_confidence_oracle(oracle_ids) -> bool:
     """ARTEX-port B2 helper: does any oracle_id name a high-confidence (ground-truth) oracle?"""
     return any(any(str(oid).startswith(p) for p in _HIGH_CONF_ORACLE) for oid in (oracle_ids or ()))
 
-def grade_poe(status, confirmations, high_conf, traffic_count) -> int:
+def grade_poe(status, confirmations, high_conf, traffic_count, quote_verified=False) -> int:
     """ARTEX-port B2: proof-of-exploitation grade 0-4. Shared by the chain fold (FindingStore.findings)
     and the report fold (run_monitor._fold_ledger) so both surfaces grade a finding identically.
       0 = not verified · 1 = verified, claim only · 2 = + a bound replayable proof exchange
-      3 = ground-truth oracle OR >=2 independent confirmations · 4 = that AND a bound exchange (strongest)."""
+      3 = ground-truth oracle OR >=2 independent confirmations OR a verbatim-quote-proven exchange
+      4 = a STRONG signal AND a bound exchange (strongest).
+    B2 EXTENSION: a bound exchange carrying a verified VERBATIM QUOTE (ARTEX requires a quote for a finding
+    to count as verified) is itself a strong signal -- it can lift PoE to 3/4 the way a ground-truth oracle
+    or a 2nd confirmation does. `quote_verified` defaults False so every existing caller grades identically."""
     if status != "verified":
         return 0
     poe = 2 if (traffic_count or 0) >= 1 else 1
-    if high_conf or (confirmations or 0) >= 2:
+    strong = bool(high_conf) or (confirmations or 0) >= 2 or bool(quote_verified)
+    if strong:
         poe = max(poe, 3)
-    if (high_conf or (confirmations or 0) >= 2) and (traffic_count or 0) >= 1:
+    if strong and (traffic_count or 0) >= 1:
         poe = 4
     return poe
 
@@ -538,7 +596,10 @@ class FindingStore:
             f["bound_evidence"] = dedup                  # merged, deduped -- for reports + retest
             tc = len(dedup)
             f["traffic_count"] = tc
-            f["poe"] = grade_poe(f.get("status"), n, hi_conf, tc)
+            # B2 EXTENSION: a bound exchange carrying a verified verbatim quote is a strong proof signal.
+            qv = any(bool(ev.get("quote_ok")) for ev in dedup)
+            f["quote_verified"] = qv
+            f["poe"] = grade_poe(f.get("status"), n, hi_conf, tc, qv)
             # #2 assurance: oracle DISAGREEMENT (verified AND a non-verified verdict on the same finding) +
             # a CALIBRATED confidence (downgraded by disagreement and a high reflective FP-risk from #6).
             _vd = verdicts.get(fid, {})
@@ -554,6 +615,13 @@ class FindingStore:
             f["verdict_spread"] = _vd
             f["confidence"] = grade_confidence(f.get("status"), n, hi_conf, tc, f["poe"],
                                                f["disagreement"], (f.get("reflection") or {}).get("fp_risk", ""))
+            # A2 EXTENSION: non-destructive "auto-move to Fixed". The hash chain + original status are NEVER
+            # mutated (a 'fixed' must never erase the proof it was once real); instead the fold exposes an
+            # ADVISORY effective_status derived from the latest retest verdict, so reports/UX can show Fixed
+            # while the immutable record still proves it was reproducible. Latest retest wins.
+            _rt = f.get("retest")
+            _rtv = _rt.get("verdict") if isinstance(_rt, dict) else _rt
+            f["effective_status"] = "fixed" if _rtv == "fixed" else f.get("status")
         return state
 
     def assurance(self) -> dict:
