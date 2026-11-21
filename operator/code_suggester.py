@@ -56,15 +56,56 @@ def _deepseek(user: str, max_tokens: int, temperature: float) -> str:
     body = json.dumps(payload).encode()
     req = urllib.request.Request(ep + "/chat/completions", data=body, method="POST",
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-    r = json.load(urllib.request.urlopen(req, timeout=180))
-    m = (r.get("choices") or [{}])[0].get("message", {})
-    _content = (m.get("content") or "").strip()
-    if _content:
-        return _content
-    # No final answer (e.g. a thinking model ran out of budget mid-reasoning). Surface the
-    # reasoning but LABEL it, so raw chain-of-thought is never mistaken for a clean answer.
-    _reasoning = (m.get("reasoning_content") or "").strip()
-    return ("[raw reasoning, no final content] " + _reasoning) if _reasoning else ""
+    try:
+        r = json.load(urllib.request.urlopen(req, timeout=180))
+        m = (r.get("choices") or [{}])[0].get("message", {})
+        _content = (m.get("content") or "").strip()
+        if _content:
+            return _content
+        # No final answer (e.g. a thinking model ran out of budget mid-reasoning). Surface the
+        # reasoning but LABEL it, so raw chain-of-thought is never mistaken for a clean answer.
+        _reasoning = (m.get("reasoning_content") or "").strip()
+        if _reasoning:
+            return "[raw reasoning, no final content] " + _reasoning
+        # empty final answer -> fall through to the CF failover below
+    except Exception as e:
+        # DS DIRECT (api.deepseek.com) failed -- most often HTTP 402 Payment Required (no credit), or
+        # 410 (model retired) / 429 (throttle) / a network error. Fail OVER to DeepSeek FLASH on Cloudflare
+        # Workers AI ('deepseek-cf' = @cf/deepseek-ai/deepseek-v4.1-flash-1017) so the code bench's DS seat
+        # keeps producing (per board_roster failover channel). Opt out with AEGIS_DS_CF_FAILOVER=0.
+        if os.environ.get("AEGIS_DS_CF_FAILOVER", "1") == "0":
+            return f"[error] DeepSeek direct failed, CF failover disabled: {type(e).__name__}: {str(e)[:120]}"
+    return _ds_cf_fallback(user, max_tokens, temperature)
+
+
+def _ds_cf_fallback(user: str, max_tokens: int, temperature: float) -> str:
+    """DS DIRECT (api.deepseek.com) failover -> DeepSeek FLASH on Cloudflare Workers AI ('deepseek-cf').
+    Used when the direct path is out of credit (402), retired (410), throttled (429) or returns empty.
+    deepseek-flash still THINKS intermittently under the heavy code role, so give it a generous token
+    FLOOR (so it finishes thinking AND emits clean content) + one retry; if it still only yields raw
+    reasoning, fall back to a reliable NON-reasoning CF coder so the DS seat is never dark. Same
+    code-flavoured role throughout. Disable the whole failover with AEGIS_DS_CF_FAILOVER=0."""
+    def _bad(t):
+        s = (t or "").lstrip()
+        return (not s) or s.startswith("[raw reasoning") or s.startswith("[error")
+    budget = max(int(max_tokens or 0), int(os.environ.get("AEGIS_DS_CF_TOKENS", "2000")))
+    try:
+        import cf_agent
+        for _ in range(2):                              # deepseek-cf first (per the board_roster failover)
+            try:
+                out = cf_agent.ask("deepseek-cf", CODE_FLAVOURED_ROLE, user,
+                                   max_tokens=budget, temperature=temperature)
+                out = out if isinstance(out, str) else json.dumps(out)
+            except Exception as e:
+                out = f"[error] {type(e).__name__}: {str(e)[:100]}"
+            if not _bad(out):
+                return out
+        alt = cf_agent.ask("qwen2.5-coder-32b", CODE_FLAVOURED_ROLE, user,  # last resort: never go dark
+                           max_tokens=max_tokens, temperature=temperature)
+        alt = alt if isinstance(alt, str) else json.dumps(alt)
+        return alt or "[deepseek-cf + qwen fallback empty]"
+    except Exception as e:
+        return f"[deepseek unavailable: direct + CF both failed: {type(e).__name__}: {str(e)[:120]}]"
 
 
 _DS_NAMES = {"ds", "deepseek", "deepseek-direct", "deepseek-v4-pro", "deepseek-v4-flash"}
