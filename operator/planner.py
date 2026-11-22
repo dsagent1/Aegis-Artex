@@ -82,6 +82,191 @@ def _class_to_action(cls: str) -> str:
     return "web"
 
 
+_CRAWL_CACHE = {}
+def crawl_surfaces(base, cap=None):
+    """GENERAL surface discovery -- the engine's missing recon stage. Reads the target's OWN root HTML +
+    linked JS bundles + any OpenAPI/Swagger doc and extracts real endpoint paths (/api/.., /rest/..,
+    /graphql, ..). TARGET-DRIVEN (the app tells us its endpoints), NOT a hardcoded path list -- so it
+    generalises to any web app / SPA instead of guessing /api/auth/login. Offline-safe ([] on any
+    failure), same-origin, cached per base. Gate AEGIS_CRAWL=0; caps AEGIS_CRAWL_CAP (150) / AEGIS_CRAWL_JS (12)."""
+    if str(os.environ.get("AEGIS_CRAWL", "1")).lower() in ("0", "false", "no", "off"):
+        return []
+    base = (base or "").rstrip("/")
+    if not base:
+        return []
+    if base in _CRAWL_CACHE:
+        return _CRAWL_CACHE[base]
+    import re as _re
+    cap = int(cap or os.environ.get("AEGIS_CRAWL_CAP", "150")); js_cap = int(os.environ.get("AEGIS_CRAWL_JS", "12"))
+    import time as _time
+    _tries = int(os.environ.get("AEGIS_CRAWL_RETRIES", "4"))
+    def _get1(u):
+        try:
+            import requests as _rq
+            try: _rq.packages.urllib3.disable_warnings()
+            except Exception: pass
+            r = _rq.get(u, timeout=15, verify=False, headers={"User-Agent": "aegis-crawler"}, allow_redirects=True)
+            return r.text, r.status_code
+        except Exception:
+            try:
+                import urllib.request as _u
+                with _u.urlopen(_u.Request(u, headers={"User-Agent": "aegis-crawler"}), timeout=15) as rr:
+                    return rr.read().decode("utf-8", "replace"), rr.getcode()
+            except Exception:
+                return "", None
+    def _get(u, retry=False):
+        # cold WSL2/self-signed targets can reset the FIRST connection -> retry so discovery is reliable,
+        # not a coin-flip. Only the critical fetches (root, JS bundles) retry; doc-probes are best-effort.
+        body, code = _get1(u)
+        if retry:
+            n = 1
+            while (not body or code is None) and n < _tries:
+                _time.sleep(0.6 * n); body, code = _get1(u); n += 1
+        return body, code
+    found = set()
+    html, _ = _get(base + "/", retry=True)
+    for m in _re.findall(r'(?:href|action)=["\'](/[^"\'>#?]+)', html or "", _re.I):
+        found.add(m)
+    scripts = _re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html or "", _re.I)
+    PATH = _re.compile(r'["\'`](/(?:rest|api|graphql|socket\.io|b2b|ftp|metrics|redirect|profile|'
+                       r'login|signin|user|users|auth|session|account|admin|oauth|token|v\d)'
+                       r'[A-Za-z0-9_\-/.{}:%]*)["\'`]')
+    for s in scripts[:js_cap]:
+        u = s if s.startswith("http") else base + "/" + s.lstrip("/")
+        js, _ = _get(u, retry=True)
+        if js:
+            for m in PATH.findall(js):
+                found.add(m.split("?")[0].rstrip("/") or "/")
+    for doc in ("/api-docs", "/swagger.json", "/openapi.json", "/v3/api-docs", "/api-docs/swagger.json"):
+        body, _ = _get(base + doc)
+        if body and body.lstrip().startswith("{"):
+            try:
+                import json as _json
+                for p in (_json.loads(body).get("paths") or {}):
+                    found.add(str(p).split("?")[0])
+            except Exception:
+                pass
+    # FIRE THE ENGINE'S REAL CRAWL TOOLS (katana active+JS crawl, hakrawler) via distro_backend -> Kali, so
+    # discovery is TOOL-DRIVEN and autonomous (not just the inline regex fallback above). Same-origin paths
+    # are merged in. Offline-safe (tools absent / Kali down -> the regex pass still stands). Gate AEGIS_CRAWL_TOOLS=0.
+    if str(os.environ.get("AEGIS_CRAWL_TOOLS", "1")).lower() not in ("0", "false", "no", "off"):
+        try:
+            from urllib.parse import urlsplit as _usplit
+            base_host = _usplit(base).netloc
+            import compare_recall as _cr
+            adapters = [getattr(_cr, n, None) for n in ("adapt_katana", "adapt_hakrawler", "adapt_gospider")]
+            for adapt in [a for a in adapters if a]:
+                try:
+                    items, _summ = adapt(base + "/")
+                except Exception:
+                    continue
+                for s in (items or []):
+                    m = _re.search(r'(https?://[^\s"\'<>]+)', str(s))
+                    if not m:
+                        continue
+                    sp = _usplit(m.group(1))
+                    if sp.netloc and base_host and sp.netloc != base_host:
+                        continue                                   # same-origin only
+                    p = (sp.path or "").split("?")[0].rstrip("/") or "/"
+                    if p and p != "/":
+                        found.add(p)
+        except Exception:
+            pass
+    _JUNK = ("%60", "%28", "%29", "%7c", "%7b", "%7d", "%24", "`", "|", "{", "}", "<", ">")
+    _STATIC = (".js", ".css", ".map", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".gif",
+               ".woff", ".woff2", ".ttf", ".eot", ".webp", ".mp4", ".wasm")
+    def _ok(p):
+        if not p.startswith("/") or len(p) <= 1 or len(p) > 120 or " " in p:
+            return False
+        pl = p.lower()
+        if any(b in pl for b in _JUNK) or pl.endswith(_STATIC):
+            return False
+        return True
+    out = sorted({p.split("#")[0] for p in found if _ok(p.split("#")[0])})[:cap]
+    _CRAWL_CACHE[base] = out
+    return out
+
+
+# OBJECTIVE-DRIVEN SURFACE EVALUATION: discovery finds MANY endpoints; with a bounded budget the engine must
+# attack the ones MOST LIKELY to achieve the stated objective FIRST, not sweep them alphabetically. This is the
+# "evaluate discovered capabilities, then generate moves" stage. Deterministic (no model call, free, fast),
+# general heuristic = endpoint-semantics value x objective-alignment, noise down-weighted. Returns surfaces
+# HIGHEST-VALUE-FIRST so every downstream [:cap] slice keeps the best. Gate AEGIS_RANK_SURFACES=0.
+_SURF_VALUE = {
+    "login": 7, "signin": 7, "authenticate": 6, "session": 4, "token": 4, "oauth": 4, "jwt": 4,
+    "password": 5, "reset": 4, "whoami": 3, "admin": 7, "account": 5, "role": 5, "privilege": 5,
+    "user": 5, "users": 5, "profile": 4,
+    "search": 5, "query": 4, "find": 4, "filter": 4, "product": 3, "report": 4, "render": 4,
+    "template": 5, "feedback": 4, "complaint": 3, "comment": 4, "memory": 3, "message": 3, "note": 3,
+    "upload": 5, "file": 4, "import": 4, "avatar": 3, "photo": 3, "image": 2,
+    "order": 4, "payment": 5, "invoice": 4, "wallet": 5, "card": 5, "basket": 4, "deluxe": 4,
+    "balance": 4, "coupon": 4, "address": 3, "securityanswer": 5, "securityquestion": 3,
+    "redirect": 4, "fetch": 5, "proxy": 4, "callback": 3, "url": 3, "track": 3, "graphql": 5,
+}
+_SURF_NOISE = ("captcha", "socket.io", "i18n", "assets", "favicon", "robots", "sitemap",
+               ".well-known", "metrics", "health", "ping", "video", "web3", "country-mapping",
+               "chatbot", "languages")
+_OBJ_THEMES = {
+    "idor": ("user", "users", "account", "order", "basket", "card", "address", "invoice", "wallet"),
+    "access": ("admin", "user", "users", "account", "role", "profile"),
+    "auth": ("login", "signin", "authenticate", "password", "reset", "token", "session"),
+    "inject": ("search", "query", "find", "filter", "product", "login"),
+    "sql": ("search", "login", "product", "query", "find"),
+    "xss": ("search", "feedback", "comment", "product", "message", "memory"),
+    "ssrf": ("fetch", "url", "proxy", "redirect", "callback", "image"),
+    "upload": ("upload", "file", "import", "avatar"),
+    "misconfig": ("admin", "metrics", "config", "debug", "api-docs"),
+    "redirect": ("redirect", "url", "callback"),
+}
+def rank_surfaces(surfaces, objective="", stack=None):
+    uniq = list(dict.fromkeys(s for s in (surfaces or []) if s))
+    if str(os.environ.get("AEGIS_RANK_SURFACES", "1")).lower() in ("0", "false", "no", "off"):
+        return uniq
+    obj = (objective or "").lower()
+    def score(s):
+        sl = s.lower(); sc = 0.0
+        for tok, w in _SURF_VALUE.items():
+            if tok in sl:
+                sc += w
+        if any(n in sl for n in _SURF_NOISE):
+            sc -= 8
+        for theme, toks in _OBJ_THEMES.items():          # the stated goal steers the ranking
+            if theme in obj and any(t in sl for t in toks):
+                sc += 3
+        if sl.startswith(("/api/", "/rest/")):
+            sc += 1
+        sc -= 0.3 * sl.count("/")                         # prefer shallow collections over deep/templated
+        return sc
+    return sorted(uniq, key=lambda s: (-score(s), s))
+
+
+def _seed_priority(move, objective=""):
+    """Objective-value of a seed MOVE (higher = scheduled earlier). The budget is small; the loop must
+    START with the moves most likely to achieve the objective (auth-bypass / SQLi / IDOR / XSS) rather than
+    sweep low-value classes and never reach them. Move-level analog of rank_surfaces -> together they make
+    the whole discover -> evaluate -> attack pipeline objective-driven. Gate AEGIS_RANK_SEEDS=0."""
+    if not isinstance(move, dict):
+        return 0.0
+    blob = " ".join(str(move.get(k) or "") for k in ("vuln_class", "action", "technique", "angle")).lower()
+    sc = 0.0
+    W = {"auth_bypass": 9, "sql_raw": 9, "sql": 8, "broken-authentication": 7, "injection": 5,
+         "idor": 6, "broken-access": 6, "access-control": 6, "xss": 6, "cross-site-scripting": 6,
+         "ssrf": 5, "mass-assign": 5, "mass_assign": 5, "file-upload": 5, "file_upload": 5,
+         "nuclei": 4, "known-vuln": 4, "security-misconfig": 4, "misconfig": 4, "nested-write": 4,
+         "security_headers": 2, "rate": 3, "csrf": 3, "open-redirect": 3, "open_redirect": 3}
+    for k, w in W.items():
+        if k in blob:
+            sc += w
+    sc += {"high": 3, "medium": 1, "low": 0}.get((move.get("severity") or "").lower(), 0)
+    if move.get("auth_bypass"):
+        sc += 4
+    obj = (objective or "").lower()
+    for kw in ("idor", "access", "auth", "inject", "sql", "xss", "ssrf", "upload", "redirect", "misconfig"):
+        if kw in obj and kw[:3] in blob:
+            sc += 2
+    return sc
+
+
 # CANDIDATE-PLAN SCENARIOS (stage 3): each varies technique ORDER, novel-probe budget, surface
 # priority. `fit` weights which scenario leads per task-level (fact-finding favours covert/thorough;
 # a pentest favours fast-track). The board can still devise novel moves inside every scenario.
@@ -197,14 +382,23 @@ class Planner:
         return sorted(found)
 
     def fingerprint(self, target: str, surfaces=None, roles=None, stack=None,
-                    task_level: str = "fact-finding") -> dict:
+                    task_level: str = "fact-finding", objective: str = "") -> dict:
         # RELEVANCE IS DATA-DRIVEN: if the caller didn't pin a stack, auto-detect it from the live target
         # (recon), then MERGE with anything passed -- so ranked techniques + board novelty stay ON-STACK.
         detected = self._detect_stack(target)
         stk = sorted(set(list(stack or [])) | set(detected))
-        return {"target": target, "surfaces": surfaces or [], "roles": roles or ["owner"],
+        # SURFACE DISCOVERY (general recon): if the caller didn't pin surfaces, crawl the live target for its
+        # OWN endpoints -- so every surface-driven seed (frontdoor/rate/idor/breadth/sqli) targets REAL routes
+        # instead of hardcoded fallbacks like /api/auth/login. Same data-driven posture as stack auto-detect.
+        passed = list(surfaces or [])
+        crawled = passed if passed else crawl_surfaces(target)
+        # EVALUATE discovered surfaces against the objective and store HIGHEST-VALUE-FIRST, so the bounded
+        # budget's capped seeds attack the most promising endpoints first instead of alphabetically.
+        surf = rank_surfaces(passed or crawled, objective, stk)
+        return {"target": target, "surfaces": surf, "roles": roles or ["owner"],
                 "stack": stk, "stack_detected": detected, "task_level": task_level,
-                "terms": " ".join([task_level] + stk + list(surfaces or []))}
+                "crawled_surfaces": surf, "objective": objective,
+                "terms": " ".join([task_level] + stk + list(surf)[:8])}
 
     def rank(self, fp: dict, limit: int = 12) -> list:
         """Ranked prior-successful techniques for the fingerprint. DB order (keyword x learned-EV) is
@@ -492,7 +686,7 @@ class Planner:
     def plan(self, objective: str, target: str, surfaces=None, roles=None, stack=None,
              task_level: str = "fact-finding", base: str = None, limit: int = 12, board: bool = True,
              novel: int = 4) -> dict:
-        fp = self.fingerprint(target, surfaces, roles, stack, task_level)
+        fp = self.fingerprint(target, surfaces, roles, stack, task_level, objective=objective)
         ranked = self.rank(fp, limit=limit * 2)                     # over-fetch candidates
         relevant = self.select(ranked, fp, board=board, keep=limit)  # board keeps only what applies here
         seeds = self.seed_moves(relevant, base or target, roles=roles)   # DB/ATT&CK-known anchors
@@ -760,7 +954,7 @@ class Planner:
         different, not re-labels. Scored `scenario_fit(task_level) + emphasis_coverage + novelty + breadth`
         and returned best-first: plans[0] seeds the run, the rest are the mid-run RE-OPEN queue.
         Offline-safe: board off/unreachable -> scenarios still differ by emphasis ordering."""
-        fp = self.fingerprint(target, surfaces, roles, stack, task_level)
+        fp = self.fingerprint(target, surfaces, roles, stack, task_level, objective=objective)
         # ACTIVE CRAWL (commercial-parity): discover the REAL surface (the SPA's live XHR/API endpoints) as
         # each role and MERGE it into the fingerprint, so every oracle (idor/xss/rate/mass-assign/secrets)
         # seeds against discovered endpoints -- not just guessed paths (the false-parity trap). One crawl
@@ -855,6 +1049,27 @@ class Planner:
              'inject':{'status':'PAID','total':0.01,'approved':True,'id':'aegis-forced'},
              'vuln_class':'mass-assignment','technique':'mass-assign','severity':'high','seed':'planner',
              'why_novel':'inject privileged fields into an invoice create (mass assignment)'}])
+        # SQLi battery (GAP-2 FIX): login auth-bypass (' OR 1=1--) via the purpose-built sql_raw leg
+        # (SqlAuthBypassOracle) + boolean-diff on search-ish read handlers. There was NO sql_raw seed before,
+        # so the leg was never scheduled; the dispatch normalizer resolves the REAL login endpoint. Gate AEGIS_SQLI_SEED=0.
+        _sqli_login = [x for x in (fp.get('surfaces') or []) if any(k in str(x).lower() for k in ('login','signin','auth'))]
+        # prefer an API-ish login endpoint (contains rest/api/auth) over a bare SPA route like /login, so the
+        # auth-bypass anchor hits the real handler even without the dispatch normalizer's behaviour-probe.
+        _sqli_login.sort(key=lambda c: (0 if any(k in c.lower() for k in ('rest','api','/auth')) else 1, len(c)))
+        _sqli_read = [x for x in (fp.get('surfaces') or []) if any(k in str(x).lower() for k in ('search','q=','list','product','find','query'))]
+        sqli_seeds = ([] if str(os.environ.get('AEGIS_SQLI_SEED','1')).lower() in ('0','false','no','off') else (
+            [{'action':'sql_raw','auth_bypass':True,'surface':(_sqli_login[0] if _sqli_login else '/login'),
+              'vuln_class':'sql-injection','technique':'sqlraw.authbypass','layer':'code','severity':'high','seed':'planner',
+              'why_novel':"SQLi auth-bypass on the login endpoint (' OR 1=1--)"}]
+            + [{'action':'sql_raw','surface':u,'param':'q','value':'1','vuln_class':'sql-injection',
+                'technique':'sqlraw.boolean','layer':'code','severity':'high','seed':'planner',
+                'why_novel':f'boolean-diff SQLi on {u}'} for u in list(dict.fromkeys(_sqli_read))[:int(os.environ.get('AEGIS_SQLI_CAP','2'))]]))
+        # nuclei enrichment (the leg exists but no action:nuclei move was ever emitted). One info-move ->
+        # matches are leads the oracle chases. Gate AEGIS_NUCLEI_SEED=0 (AEGIS_NUCLEI=0 kills the leg itself).
+        nuclei_seed = ([] if str(os.environ.get('AEGIS_NUCLEI_SEED','1')).lower() in ('0','false','no','off') else
+                       [{'action':'nuclei','surface':'/','vuln_class':'known-vuln','technique':'nuclei-enrich',
+                         'layer':'scaffold','severity':'medium','seed':'planner',
+                         'why_novel':'nuclei template sweep (severity>=medium, on-stack) -> oracle-gated leads'}])
         import copy as _copy
         plans = []
         # CVE x technique FUSION + agent extension, computed ONCE (relevancy-filtered; appropriate tooling
@@ -867,12 +1082,17 @@ class Planner:
                 _synth = _sm + self.board_extend(fp, _sm, n=2)
         for prof in _SCENARIOS[:max(1, n_scenarios)]:
             ordered = self._emphasis_sort(relevant, prof["emphasis"])
-            seeds = (disco_seeds + _copy.deepcopy(zap_seed) + _copy.deepcopy(sc_seeds) + _copy.deepcopy(bo_seeds) + _copy.deepcopy(bg_seeds) + _copy.deepcopy(fd_seeds) + _copy.deepcopy(in_seeds) + _copy.deepcopy(st_seeds) + _copy.deepcopy(sy_seeds)
-                     + _copy.deepcopy(id_seeds) + _copy.deepcopy(rt_seeds) + _copy.deepcopy(sh_seeds)
-                     + _copy.deepcopy(sfx_seeds) + _copy.deepcopy(or_seeds) + _copy.deepcopy(ma_seeds)
-                     + _copy.deepcopy(cs_seeds) + _copy.deepcopy(ss_seeds) + _copy.deepcopy(xss_seeds)
-                     + _copy.deepcopy(up_seeds)
-                     + self.seed_moves(ordered, base or target, roles=roles))
+            # EVALUATE-THEN-ATTACK: recon anchors (disco) first to establish the target, then the attack
+            # seeds ORDERED BY OBJECTIVE-VALUE (auth-bypass/SQLi/IDOR/XSS lead) so a small budget starts with
+            # the moves most likely to achieve the goal instead of sweeping low-value classes. Gate AEGIS_RANK_SEEDS=0.
+            _attack = (_copy.deepcopy(zap_seed) + _copy.deepcopy(sc_seeds) + _copy.deepcopy(bo_seeds) + _copy.deepcopy(bg_seeds) + _copy.deepcopy(fd_seeds) + _copy.deepcopy(in_seeds) + _copy.deepcopy(st_seeds) + _copy.deepcopy(sy_seeds)
+                       + _copy.deepcopy(id_seeds) + _copy.deepcopy(rt_seeds) + _copy.deepcopy(sh_seeds)
+                       + _copy.deepcopy(sfx_seeds) + _copy.deepcopy(or_seeds) + _copy.deepcopy(ma_seeds)
+                       + _copy.deepcopy(cs_seeds) + _copy.deepcopy(ss_seeds) + _copy.deepcopy(xss_seeds)
+                       + _copy.deepcopy(up_seeds) + _copy.deepcopy(sqli_seeds) + _copy.deepcopy(nuclei_seed))
+            if str(os.environ.get("AEGIS_RANK_SEEDS", "1")).lower() not in ("0", "false", "no", "off"):
+                _attack = sorted(_attack, key=lambda m: -_seed_priority(m, objective))
+            seeds = (disco_seeds + _attack + self.seed_moves(ordered, base or target, roles=roles))
             nmoves = (self.board_novel(fp, known_ids, n=prof["novel"]) if (board and prof["novel"]) else []) + _copy.deepcopy(_synth)
             for m in seeds + nmoves:                      # tag scenario for the audit/report
                 m["scenario"] = prof["name"]

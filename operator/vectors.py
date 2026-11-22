@@ -1218,7 +1218,7 @@ def rate(move, ctx):
     try: _rq.packages.urllib3.disable_warnings()
     except Exception: pass
     base = (ctx or {}).get("base") or os.environ.get("AEGIS_TARGET") or "https://localhost:8443"
-    path = move.get("surface") or move.get("path") or "/api/auth/login"
+    path = move.get("surface") or move.get("path") or _discover_login(base)
     method = (move.get("method") or "POST").upper()
     if method in ("DELETE", "PUT"):                      # never a destructive verb for a rate probe
         return {"status": 0, "blocked": "rate probe restricted to GET/POST", "body": ""}
@@ -1447,7 +1447,7 @@ def csrf(move, ctx):
     s = _rq.Session(); s.verify = False
     set_cookies, body, hdrs = [], "", {}
     try:
-        url = os.environ.get("AEGIS_LOGIN_URL") or (base.rstrip("/") + "/api/auth/login")
+        url = os.environ.get("AEGIS_LOGIN_URL") or (base.rstrip("/") + _discover_login(base))
         pin = os.environ.get("AEGIS_LOGIN_PIN") or os.environ.get("AEGIS_TEST_PIN") or "000000"
         idf = os.environ.get("AEGIS_LOGIN_ID_FIELD", "name"); pf = os.environ.get("AEGIS_LOGIN_PIN_FIELD", "pin")
         try:
@@ -1493,7 +1493,7 @@ def security_headers(move, ctx):
     set_cookies, headers = [], {}
     # a real login to capture Set-Cookie (session-cookie flags)
     try:
-        url = os.environ.get("AEGIS_LOGIN_URL") or (base.rstrip("/") + "/api/auth/login")
+        url = os.environ.get("AEGIS_LOGIN_URL") or (base.rstrip("/") + _discover_login(base))
         pin = os.environ.get("AEGIS_LOGIN_PIN") or os.environ.get("AEGIS_TEST_PIN") or "000000"
         idf = os.environ.get("AEGIS_LOGIN_ID_FIELD", "name"); pf = os.environ.get("AEGIS_LOGIN_PIN_FIELD", "pin")
         ident = None
@@ -1536,7 +1536,7 @@ def session_fixation(move, ctx):
     try:
         s.get(base.rstrip("/") + "/", timeout=20, verify=False)          # obtain a pre-auth session
         pre = s.cookies.get(cookie_name)
-        url = os.environ.get("AEGIS_LOGIN_URL") or (base.rstrip("/") + "/api/auth/login")
+        url = os.environ.get("AEGIS_LOGIN_URL") or (base.rstrip("/") + _discover_login(base))
         pin = os.environ.get("AEGIS_LOGIN_PIN") or os.environ.get("AEGIS_TEST_PIN") or "000000"
         idf = os.environ.get("AEGIS_LOGIN_ID_FIELD", "name"); pf = os.environ.get("AEGIS_LOGIN_PIN_FIELD", "pin")
         try:
@@ -1778,6 +1778,105 @@ def filter_injection(move, ctx):
 def _looks_login(path):
     p = (path or "").lower()
     return any(s in p for s in ("login", "signin", "sign-in", "authenticate", "/session", "/auth"))
+
+
+_LOGIN_SURFACE_CACHE = {}
+def _discover_login(base, with_conf=False):
+    """GAP-1 FIX: the real login endpoint varies by app (/rest/user/login, /api/auth/login, ...).
+    Guessing it wrong sends every auth attack at a dead URL (juice-shop: /api/auth/login -> 500, real
+    login is /rest/user/login). Probe common candidates once per base; pick the one that BEST BEHAVES like
+    a login (rejects bad creds 400/401/403 = conf 3; 200/422/429 = conf 2) over one that 404/405/500s.
+    Returns the path, or (path, confidence) when with_conf -- callers gate a surface rewrite on conf>=2 so
+    a FAILED discovery never forces an attack at a non-auth endpoint (board-flagged regression). Generic/
+    target-driven, cached. Override: AEGIS_LOGIN_URL (callers); AEGIS_LOGIN_CANDIDATES to tune the list."""
+    base = (base or os.environ.get("AEGIS_TARGET") or "").rstrip("/")
+    if not base:
+        return ("/api/auth/login", 0) if with_conf else "/api/auth/login"
+    if base in _LOGIN_SURFACE_CACHE:
+        best, best_score = _LOGIN_SURFACE_CACHE[base]
+        return (best, best_score) if with_conf else best
+    cands = [c.strip() for c in os.environ.get("AEGIS_LOGIN_CANDIDATES", "").split(",") if c.strip()] or [
+        "/rest/user/login", "/api/auth/login", "/api/login", "/api/users/login", "/api/v1/auth/login",
+        "/user/login", "/auth/login", "/login", "/api/sessions", "/session", "/api/account/login", "/signin"]
+    emf = os.environ.get("AEGIS_USER_FIELD", "email"); pwf = os.environ.get("AEGIS_PW_FIELD", "password")
+    best, best_score = "/api/auth/login", 0
+    try:
+        import requests as _rq
+        try: _rq.packages.urllib3.disable_warnings()
+        except Exception: pass
+        for p in cands:
+            try:
+                r = _rq.post(base + p, json={emf: "probe_%d@example.invalid" % os.getpid(), pwf: "x"},
+                             timeout=8, verify=False)
+                sc = r.status_code
+            except Exception:
+                continue
+            score = 3 if sc in (400, 401, 403) else 2 if sc in (200, 422, 429) else 0
+            if score > best_score:
+                best, best_score = p, score
+            if score == 3:
+                break
+    except Exception:
+        pass
+    _LOGIN_SURFACE_CACHE[base] = (best, best_score)
+    return (best, best_score) if with_conf else best
+
+
+_AUTHBYPASS_HINTS = ("auth-bypass", "auth_bypass", "authbypass", "broken-authentication",
+                     "broken_authentication", "broken-auth", "login-bypass", "login_bypass",
+                     "sql-login", "sqli-login")
+_SQLI_HINTS = ("sql injection", "sql-injection", "sql_injection", "sqli", "sqlraw", "sql_raw",
+               "union select", "boolean-blind", "time-blind sql")
+def _move_blob(move):
+    return " ".join(str(move.get(k) or "") for k in
+                    ("vuln_class", "angle", "technique", "mechanism", "why_novel", "intent")).lower()
+
+_GENERIC_ACTIONS = ("web", "fact", "authz", "authz_fuzz", "", None)   # moves safe to RE-ROUTE
+def _normalize_move(move, ctx):
+    """GAP-2 FIX (board-hardened): route a move to the RIGHT specialized leg + the REAL login surface
+    BEFORE dispatch. The board/planner reason in vuln CLASSES ('sql-injection','broken-authentication')
+    but the loop dispatches by move['action'] (a LEGS key), and the class->action map collapses these to
+    the generic `web` leg -- so the purpose-built `sql_raw` leg (SqlAuthBypassOracle) was never called.
+
+    Board review (gpt-oss-120b/qwen) flagged two risks in the naive version, fixed here:
+      * DO NOT hijack an EXPLICIT specialized leg (e.g. session_fixation) -> only re-route GENERIC moves,
+        so multiple legs per class still run (the planner also seeds a dedicated sql_raw anchor).
+      * CONFIDENCE-GATE the surface rewrite (conf>=2) so a FAILED login discovery never forces an attack
+        at a non-auth endpoint.
+    Gate AEGIS_MOVE_NORMALIZE=0."""
+    if not isinstance(move, dict):
+        return move
+    if str(os.environ.get("AEGIS_MOVE_NORMALIZE", "1")).lower() in ("0", "false", "no", "off"):
+        return move
+    base = (ctx or {}).get("base") or os.environ.get("AEGIS_TARGET") or ""
+    act = move.get("action") or "web"
+    surface = move.get("surface") or move.get("path") or ""
+    blob = _move_blob(move)
+    login_surf = _looks_login(surface)
+    authbypass = any(h in blob for h in _AUTHBYPASS_HINTS) or bool(move.get("auth_bypass"))
+    sqli = any(h in blob for h in _SQLI_HINTS) or "sql" in (move.get("vuln_class") or "").lower()
+    need_login = authbypass or login_surf
+    real, conf = _discover_login(base, with_conf=True) if (need_login or (sqli and login_surf)) else (surface, 0)
+    # (A) GENERIC auth-bypass / sqli-on-login move -> re-route to the purpose-built sql_raw leg.
+    if (authbypass or (sqli and login_surf)) and act in _GENERIC_ACTIONS:
+        move["action"] = "sql_raw"; move["auth_bypass"] = True
+        if conf >= 2:
+            move["surface"] = real; (ctx or {})["login_surface"] = real
+        return move
+    # (B) an already-sql_raw auth-bypass/login move (e.g. the planner anchor) -> fix its surface only.
+    if act == "sql_raw" and need_login and conf >= 2:
+        move["surface"] = real; (ctx or {})["login_surface"] = real
+        return move
+    # (C) explicit SQLi on a read handler -> sql_raw boolean-diff arm (keep the surface).
+    if sqli and act in ("web", "fact", "authz", ""):
+        move["action"] = "sql_raw"
+        return move
+    # (D) EXPLICIT login-targeted leg (rate/front_door/session_fixation) -> keep its action, only aim it at
+    #     the REAL login (preserve intent; board: multiple legs per class). Confidence-gated.
+    if login_surf and act in ("rate", "front_door", "session_fixation", "web", "authz", "authz_fuzz"):
+        if conf >= 2 and real != surface:
+            move["surface"] = real; (ctx or {})["login_surface"] = real
+    return move
 
 
 def _bo_authed(r, j):
@@ -2237,6 +2336,7 @@ def vector_names():
 
 def dispatch(move, phase, ctx):
     """Run the vector for move['action'] (default web). Returns the leg result + the move."""
+    move = _normalize_move(move, ctx)
     leg = LEGS.get(move.get("action", "web"), web)
     try:
         res = leg(move, ctx)
