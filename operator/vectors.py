@@ -42,12 +42,43 @@ def _kali(cmd: str, timeout: int = 600) -> str:
         return f"[kali error: {e}]"
 
 
+# TOOL-CONCURRENCY GATE (memory safety for PARALLEL hunts, e.g. agent_hunt.MultiAgentHunt): external tool
+# shellouts (nuclei/msf/nmap/katana...) are the RAM-heavy part of a probe. When N worker threads each fire a
+# Kali subprocess at once a small box OOMs / gets reaped. AEGIS_TOOL_CONCURRENCY=K caps CONCURRENT tool
+# subprocesses to K across ALL threads while lightweight network probes still fan out freely. Unset/0 =
+# unbounded (legacy, unchanged). Lazily built, thread-safe; the cap is read once at first tool call.
+import threading as _threading
+_TOOL_SEM = None
+_TOOL_SEM_INIT = False
+_TOOL_SEM_LOCK = _threading.Lock()
+
+def _tool_gate():
+    """Return a bounded Semaphore (AEGIS_TOOL_CONCURRENCY>0) or None (unbounded/legacy)."""
+    global _TOOL_SEM, _TOOL_SEM_INIT
+    if not _TOOL_SEM_INIT:
+        with _TOOL_SEM_LOCK:
+            if not _TOOL_SEM_INIT:
+                try:
+                    _n = int(os.environ.get("AEGIS_TOOL_CONCURRENCY", "0"))
+                except Exception:
+                    _n = 0
+                _TOOL_SEM = _threading.Semaphore(_n) if _n > 0 else None
+                _TOOL_SEM_INIT = True
+    return _TOOL_SEM
+
 # G49: route a TOOL-bearing command through the multi-distro backend (Kali present -> run there; portable-
 # missing -> install into Kali; non-portable/missing -> BlackArch(Arch) container). This is what makes the
 # AutoLoop actually USE the Kali<->Arch alternation for its external tools (nmap/semgrep/nuclei/msf), instead
 # of running everything in Kali and silently degrading when a tool only exists in BlackArch. Any router error
 # (or AEGIS_TOOL_ROUTER=0) falls back to plain _kali so behaviour never regresses.
 def _route_line(tool, full_cmd, timeout=600):
+    sem = _tool_gate()
+    if sem is None:
+        return _route_line_impl(tool, full_cmd, timeout)
+    with sem:                                  # cap concurrent tool subprocesses (parallel-hunt RAM safety)
+        return _route_line_impl(tool, full_cmd, timeout)
+
+def _route_line_impl(tool, full_cmd, timeout=600):
     if os.environ.get("AEGIS_TOOL_ROUTER", "1") == "0":
         return _kali(full_cmd, timeout)
     try:

@@ -52,6 +52,16 @@ convergence** (escalation of an oracle-confirmed foothold is a small, capped, no
 breadth is preserved across it); the budget counts only **information-gaining** attempts (generic 404s /
 transport errors / repeats are noise, bounded separately, and cannot pad the count). Only oracle-verified
 findings count. Run: `python operator/iterative_hunt_live.py --objective "..." --role owner --budget 40`.
+**Parallel hunt (same engine, N workers).** `operator/agent_hunt.py` (`MultiAgentHunt`) runs the loop
+PULL-BASED: ONE central novelty-brain owns dedup/direction/budget and hands each worker a distinct
+`(angle, surface, vuln-class, mechanism, oracle-signal)` fingerprint; N worker threads execute+oracle
+concurrently via a `ThreadPoolExecutor`; a single-writer oracle serializes the hash-chained ledger so
+parallelism can't race or double-count. Drive it with `operator/agent_hunt_live.py` (inherits the Planner +
+vectors unchanged): `python operator/agent_hunt_live.py --objective "..." --role owner --budget 24 --agents 4`.
+**Memory safety:** the RAM-heavy part of a probe is the external tool shellout, so cap CONCURRENT tool
+subprocesses with `AEGIS_TOOL_CONCURRENCY=K` (bounded Semaphore at the `vectors._route_line` choke point;
+unset/0 = unbounded/legacy). On a small box run FOREGROUND + lean: `AEGIS_CRAWL_TOOLS=0`, `--max-board-rounds 0`,
+`--agents 2 --budget 16`, `AEGIS_TOOL_CONCURRENCY=1`.
 - Docs: `README.md`, `INSTALL.md`, `docs/PIPELINE.md` (the canonical flow + honest status table),
   `docs/ARCHITECTURE_DIAGRAM.md`, `HELP.md` (human how-tos, e.g. porting fixes to the mirror; operator-searchable).
 
@@ -192,6 +202,9 @@ external-agent recruitment / persistence / evasion; only oracle-verified finding
 - Generic-target env (keep the repo generic — no client values in code): DB oracle defaults `AEGIS_DB_USER`
   / `AEGIS_DB_NAME` (default `app`); demo/test login PIN `AEGIS_TEST_PIN` (default `000000`); target base
   `AEGIS_TARGET`; Kali distro `AEGIS_KALI_DISTRO`. Point these at the mirror on the box, not in the code.
+- Parallel-hunt RAM safety: `AEGIS_TOOL_CONCURRENCY=K` caps concurrent external-tool subprocesses across all
+  worker threads (0/unset = unbounded). Essential for `MultiAgentHunt` on a small box; pair with foreground +
+  lean flags. The gate sits at the `vectors._route_line` choke point, so it covers every nuclei/msf/nmap shellout.
 - Online CVE refresh (opt-in): `AEGIS_RAG_ONLINE=1` enables it; `AEGIS_RAG_MAX_AGE_H` (default 12) is the
   staleness window; `AEGIS_RAG_HOME` (default `/opt/aegis-rag`). Public vuln feeds only (authorized-OSINT
   lane), never target data; offline-safe (a feed/network failure leaves the local store intact).
