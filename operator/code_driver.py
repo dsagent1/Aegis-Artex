@@ -431,23 +431,73 @@ def stats(con):
 
 
 # ---------------- the three model-backed steps (real, with dry fallbacks) ----------------
+def _extract_json_obj(text):
+    """Return the FIRST balanced {...} object substring, honoring string quotes/escapes. Robust to models
+    that bury the object in prose (greedy \\{.*\\} would grab a '{id}' in the narrative and fail to parse)."""
+    s = text or ""
+    start = s.find("{")
+    if start < 0:
+        return None
+    depth = 0; in_str = False; esc = False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if esc: esc = False
+            elif c == "\\": esc = True
+            elif c == '"': in_str = False
+        elif c == '"': in_str = True
+        elif c == "{": depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start:i + 1]
+    return None   # unbalanced / truncated mid-object
+
+
+# A HARD output contract appended to the reasoner's system prompt. CF-hosted DeepSeek flash ignores the
+# 'thinking:disabled' field and pours reasoning PROSE into content (observed: narrative, no JSON) -- this
+# forces a single JSON object so the proposer actually gets a hypothesis instead of "no hypothesis -> skip".
+_JSON_ONLY = ("\n\nOUTPUT CONTRACT (STRICT): reply with EXACTLY ONE valid minified JSON object and NOTHING "
+              "else -- no analysis, no chain-of-thought, no explanation, no markdown fences, no text before "
+              "or after. Your entire reply MUST start with '{' and end with '}'.")
+
 def _ds_json(prompt, max_tokens=1200, dry=False):
     if dry:
         return None
     import board_ask
     ep = (os.environ.get("AEGIS_LLM_ENDPOINT") or "https://api.deepseek.com").rstrip("/")
     key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("AEGIS_LLM_API_KEY")
+    model = os.environ.get("AEGIS_CODE_REASONER_MODEL") or "deepseek-v4-pro"
+    if "cloudflare.com" in ep:   # DS-CF route: api.deepseek.com direct may be 402 -> CF token + CF DS slug
+        key = os.environ.get("CF_API_TOKEN") or key
+        if not os.environ.get("AEGIS_CODE_REASONER_MODEL"):
+            model = "@cf/deepseek-ai/deepseek-v4.1-flash-1017"
+        max_tokens = max(max_tokens, 2000)   # flash reasons in-content; give room so the JSON isn't truncated
+    elif "openrouter.ai" in ep:  # DS-OR route: full DeepSeek-V4 chat (strong reasoner; flash can't emit the JSON)
+        key = os.environ.get("OPENROUTER_API_KEY") or key
+        if not os.environ.get("AEGIS_CODE_REASONER_MODEL"):
+            model = "deepseek/deepseek-chat"
+        max_tokens = max(max_tokens, 2000)
     try:
-        out = board_ask._post(ep + "/chat/completions", key, "deepseek-v4-pro", board_ask.PANEL_SYS,
+        out = board_ask._post(ep + "/chat/completions", key, model, board_ask.PANEL_SYS + _JSON_ONLY,
                               prompt, max_tokens, extra={"thinking": {"type": "disabled"}})
     except Exception:
         return None
     import re
-    m = re.search(r"\{.*\}", out or "", re.S)
-    try:
-        return json.loads(m.group(0)) if m else None
-    except Exception:
+    blob = _extract_json_obj(out)
+    if not blob:
         return None
+    try:
+        return json.loads(blob)
+    except Exception:
+        # Tolerant parse: DeepSeek/CF flash often emits JSON with INVALID escapes -- notably \' (apostrophe),
+        # which JSON does not allow, so strict json.loads throws and a perfectly good hypothesis is dropped.
+        try:
+            fixed = blob.replace("\\'", "'")
+            fixed = re.sub(r'\\(?![\\"/bfnrtu])', '', fixed)
+            return json.loads(fixed)
+        except Exception:
+            return None
 
 
 def propose(con, objective, target_ctx, tried, direction="code", dry=False):

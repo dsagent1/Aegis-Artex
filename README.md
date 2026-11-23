@@ -63,7 +63,13 @@ open-source offensive tooling.
 - **Record-before-finish gate** — the operator records a *candidate*; an independent **out-of-band oracle**
   promotes it to verified, so a run can never self-certify a finding.
 - **Resilient model routing** — DeepSeek-direct → **DeepSeek-over-OpenRouter** auto-failover plus a
-  Cloudflare-Workers-AI leg, so a provider 402/quota/5xx fails *over* instead of halting the hunt.
+  Cloudflare-Workers-AI leg, so a provider 402/quota/5xx fails *over* instead of halting the hunt. The DS
+  brain is reachable over **three live-selectable routes** — `/ds` (direct), `/ds-or` (OpenRouter),
+  `/ds-cf` (Cloudflare Workers AI) — swappable mid-chat so the model stays up when one provider is down.
+- **Forced-stack discipline (optional)** — by default the operator runs its own tool loop; set
+  `AEGIS_REQUIRE_STACK=1` (or `/forcedstack` live, `-RequireStack` on standby) to **refuse `finish()` until
+  a proven stack tool** (discovery / planner / RAG / Kali / oracle) has actually run, and keep the
+  verify/execute/record finish-gates armed in chat. `/freestack` returns to the free loop.
 - Runtime safety: **noise governor** (per-host pacing + 429/503 backoff), **untrusted-output nonce
   boundary**, signed **scope/authorization** gates (fail-closed).
 

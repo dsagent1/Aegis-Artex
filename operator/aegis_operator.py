@@ -1197,6 +1197,15 @@ def _handle_control(line, gate):
         _CTX["thinking"] = True;  _emit("THINK", "reasoning ON  for " + _CTX.get("brain", "ds")); return "handled"
     if low in ("/nothink", "/fast"):   # toggle reasoning OFF for the CURRENT brain (no brain switch)
         _CTX["thinking"] = False; _emit("THINK", "reasoning OFF for " + _CTX.get("brain", "ds")); return "handled"
+    if low in ("/forcedstack", "/forcestack", "/forced-stack", "/force-stack"):
+        os.environ["AEGIS_REQUIRE_STACK"] = "1"
+        _emit("STACK", "FORCED-STACK ON -- finish() refused until a proven stack tool (discovery/planner/"
+                       "RAG/Kali/oracle) is used; finish-gates armed. /freestack to let DS run on its own.")
+        return "handled"
+    if low in ("/freestack", "/unforce", "/noforce", "/nostack"):
+        os.environ["AEGIS_REQUIRE_STACK"] = "0"
+        _emit("STACK", "FORCED-STACK OFF -- free loop (DS may run on its own; chat finish-gates off).")
+        return "handled"
     if low in ("/claude", "/cli"):     # Claude via the local `claude` CLI (claude -p; no thinking toggle)
         _switch_brain("claude"); return "handled"
     if low in ("/brain", "/b"):        # cycle the drivers (keeps the current thinking mode)
@@ -4019,6 +4028,15 @@ _LAST_COMPACT_SIZE = 0   # transcript size (chars) right after the most recent s
 CHAT_MAX_ITER = 60         # max reason/act cycles per chat turn (room to babysit within a turn)
 # tools where repeating the SAME call is thrash (polling tools like read_task_context are excluded)
 _LOOP_GUARD_TOOLS = {"run_command", "run_background", "apply_edit", "write_file", "submit_aegis_task", "run_tool"}
+# STACK tools: the proven, structured machinery (discovery/planner/RAG/Kali/oracle/task-relay) as opposed to
+# free-form run_command/write_file improvisation. AEGIS_REQUIRE_STACK=1 forces the agent to actually use at
+# least one of these before finish() -- AND keeps the verify/execute/record finish-gates armed even in chat.
+_STACK_TOOLS = {"content_discovery", "fingerprint_target", "plan_and_execute", "record_finding",
+                "verify_findings", "rag_search", "exploit_search", "run_tool", "run_in_kali",
+                "submit_aegis_task", "resume_task", "provision_twin", "crack_hashes"}
+def _require_stack():
+    """True when AEGIS_REQUIRE_STACK=1: enforce stack usage + keep finish-gates on in chat (testing lever)."""
+    return os.environ.get("AEGIS_REQUIRE_STACK", "0") == "1"
 
 def _save_session(path, messages):
     """Persist the chat transcript + plan so a session can be resumed later. Atomic write."""
@@ -4252,6 +4270,8 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                                       # so "recorded" -- not an inline "verified" status -- is what satisfies the gate.
     record_nudged = False             # the record-before-finish nudge has fired once
     urgency_nudged = False            # the budget-urgency (drive the kill) nudge has fired once
+    stack_used = False                # REQUIRE-STACK gate: a proven stack tool (_STACK_TOOLS) was invoked this run
+    require_stack_nudged = False      # the require-stack nudge has fired once
     board_rescues = 0                 # BOARD-RESCUE circuit-breaker: times the board was pulled on a strategic stall
     _BOARD_MAX_RESCUES = 2            # cap board interventions so it stays an ADVISOR, never a crutch or a gate
     _BOARD_STALL_WINDOW = 7           # interaction-turns with NO new ledger progress that count as "stalled"
@@ -4597,6 +4617,8 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                              "token limit). RESEND this " + name + " call with complete, concise arguments."})})
                 _emit("STEP", f"{name} -> arguments truncated; asked model to resend", to_stdout=False)
                 continue
+            if name in _STACK_TOOLS:                            # REQUIRE-STACK: a proven stack tool was used
+                stack_used = True
             if name in ("record_finding", "chain_state"):      # record-as-you-go tracking
                 turns_since_record = 0
                 interacted_since_record = False
@@ -4742,7 +4764,18 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
             if name == "finish":
                 # VERIFY-BEFORE-FINISH (board item 4): don't accept finish() if a file was edited but never
                 # exercised/verified. Nudge ONCE to verify; then honour the next finish() regardless.
-                if mutated_unverified and not verify_nudged and not chat:
+                if _require_stack() and not stack_used and not require_stack_nudged:
+                    require_stack_nudged = True
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({
+                        "use_the_stack_first": True, "note": "AEGIS_REQUIRE_STACK is ON: you have NOT used the "
+                        "proven stack this run -- you improvised with raw commands/scripts. Before finishing, use "
+                        "the real machinery: fingerprint_target / content_discovery to map the surface, rag_search "
+                        "or exploit_search for known-vuln intel, run_tool / run_in_kali for the actual probe, and "
+                        "record_finding so the ORACLE verifies the result. Do at least one of these now, THEN "
+                        "finish(). The stack is the trustworthy path; freewheeling is not."})})
+                    _p(f"{tag} [require-stack] agent tried to finish without using the stack -- nudged to use it\n", flush=True)
+                    continue   # don't return the finish yet
+                if mutated_unverified and not verify_nudged and (not chat or _require_stack()):
                     verify_nudged = True
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({
                         "verify_before_finish": True, "note": "You edited files but have NOT functionally verified "
@@ -4753,7 +4786,7 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                     continue   # don't return the finish yet
                 # KILL-GATE (execute-before-finish): you wrote a probe/exploit script but never ran it. A
                 # script you don't execute proves nothing. Nudge ONCE; then honour the next finish().
-                if script_pending and not kill_nudged and not chat:
+                if script_pending and not kill_nudged and (not chat or _require_stack()):
                     kill_nudged = True
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({
                         "execute_before_finish": True, "note": f"You wrote {script_pending} but NEVER executed it "
@@ -4766,7 +4799,7 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                 # record_finding produced an oracle-VERIFIED result this run. Self-reported "oracle-confirmed"
                 # is a hallucination -- only the oracle verifies (ground-truth doctrine). Challenge ONCE: call
                 # record_finding with the real evidence and let the oracle rule; if it REJECTS, say so honestly.
-                if not finding_recorded and not record_nudged and not chat:
+                if not finding_recorded and not record_nudged and (not chat or _require_stack()):
                     _claim = args.get("summary", "") if isinstance(args, dict) else ""
                     if re.search(r"\b(verif|confirm|oracle|exploit|bypass|compromis|gained?\s+\w*\s*access|"
                                  r"admin\s+(access|privile)|jwt|token|auth\w*\s*bypass|critical|kill)\b",

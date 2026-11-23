@@ -31,6 +31,7 @@ param(
   [string]$CfHelper = 'gpt-oss-120b',     # cheap CF helper DS calls when stuck (cf_helper tool)
   [switch]$AutoApprove,
   [switch]$Think,                         # deeper-reasoning (thinking) mode; OFF by default (fast chat mode)
+  [switch]$RequireStack,                  # FORCE stack use: refuse finish() until a proven stack tool ran + keep finish-gates armed in chat
   [switch]$NoThink,                       # deprecated/no-op: non-thinking is the default now (kept so old invocations don't error)
   [string]$Session,
   [switch]$Resume,                        # load the saved session on start (default file is saved every turn but only picked up on request; or type /resume live)
@@ -76,6 +77,7 @@ $env:AEGIS_CF_HELPER = $CfHelper
 # fails OVER to DeepSeek-flash via Cloudflare instead of crashing the turn (CF bills Neurons, not DS credit).
 if ([string]::IsNullOrWhiteSpace($env:AEGIS_FALLBACK)) { $env:AEGIS_FALLBACK = $Fallback }
 if ($Target) { $env:AEGIS_TARGET = $Target }
+if ($RequireStack) { $env:AEGIS_REQUIRE_STACK = '1' } else { $env:AEGIS_REQUIRE_STACK = '0' }
 
 # --- pick python: $env:AEGIS_PYTHON wins, else python on PATH ---
 $py = $env:AEGIS_PYTHON
