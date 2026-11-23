@@ -57,6 +57,13 @@ open-source offensive tooling.
 - **6-model code bench** that emits runnable `TARGET/CODE/ORACLE` blocks, run + confirmed by the operator.
 - **Grey-box fuzzer** (libFuzzer / AFL++ / Honggfuzz / Atheris / Jazzer.js) — crashes verified on reproduce.
 - **Offline vuln RAG** (NVD/KEV/EPSS/Exploit-DB/MSF/nuclei) + a **remediation** closed loop.
+- **Autonomous discover→evaluate→attack loop** with a parallel `content_discovery` sweep (one pass over a
+  curated high-value endpoint list, surfacing unlinked endpoints) and budget-aware **execution discipline**
+  — simplest-probe-first, every lead checked against the oracle, no `finish()` from recon.
+- **Record-before-finish gate** — the operator records a *candidate*; an independent **out-of-band oracle**
+  promotes it to verified, so a run can never self-certify a finding.
+- **Resilient model routing** — DeepSeek-direct → **DeepSeek-over-OpenRouter** auto-failover plus a
+  Cloudflare-Workers-AI leg, so a provider 402/quota/5xx fails *over* instead of halting the hunt.
 - Runtime safety: **noise governor** (per-host pacing + 429/503 backoff), **untrusted-output nonce
   boundary**, signed **scope/authorization** gates (fail-closed).
 
