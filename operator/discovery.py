@@ -40,7 +40,7 @@ def _kali(cmd: str, timeout: int = 300) -> str:
             argv = ["wsl", "-d", WSL_DISTRO, "-u", "root", "--", "bash", "-lc", cmd]
         else:
             argv = ["bash", "-lc", cmd]
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         return (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
     except Exception as e:
         return f"[kali error: {e}]"
@@ -169,10 +169,50 @@ def fingerprint(move, ctx):
                 next_moves=[{"action": "rag", "query": s} for s in services[:3]])
 
 
+# Common high-value subdomain names for the DNS-brute lane (OWNED domains only). CT logs miss hosts with no
+# public cert -- internal CRMs, apps behind cPanel vhosts, staging -- so a bounded resolve of likely names
+# catches the high-value asset CT parity misses (e.g. a crm. vhost sharing the apex IP). Pure-socket, no tool
+# dependency; disable with AEGIS_DNS_BRUTE=0.
+_SUBDOMAIN_WORDLIST = (
+    "www crm portal app apps application admin administrator api api2 dev develop development staging stage "
+    "test testing uat qa demo sandbox preprod beta mail email webmail smtp imap autodiscover cpanel whm "
+    "webdisk cpcalendars cpcontacts ns1 ns2 vpn remote access gateway citrix rdp ssh ftp sftp dashboard "
+    "panel console manage management office intranet extranet internal corp secure login signin auth sso "
+    "account accounts billing invoice invoices pay payments erp hr support help helpdesk ticket tickets "
+    "desk service services booking bookings schedule engineer engineers field jobs job customer customers "
+    "client clients partner partners vendor store shop cart checkout blog news cms wp wordpress db database "
+    "phpmyadmin pma adminer backup backups old new mobile m static assets cdn img images media files docs "
+    "wiki git gitlab jenkins ci monitor status grafana kibana metrics proxy v1 v2"
+).split()
+
+def _dns_brute(dom, workers=16, timeout=3.0):
+    """Resolve a built-in list of likely subdomain names for an OWNED domain (DNS-brute lane). Returns
+    {host: ip} for names that resolve. Pure socket; bounded concurrency; never raises."""
+    import socket
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    socket.setdefaulttimeout(timeout)
+    names = sorted({f"{w}.{dom}" for w in _SUBDOMAIN_WORDLIST})
+    found = {}
+    def _res1(h):
+        try:
+            return h, socket.gethostbyname(h)
+        except Exception:
+            return h, None
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for fut in as_completed([ex.submit(_res1, h) for h in names]):
+                h, ip = fut.result()
+                if ip:
+                    found[h] = ip
+    except Exception:
+        pass
+    return found
+
+
 def external(move, ctx):
     """External / passive attack-surface mapping (Shodan/Censys/CT-log parity). Certificate-transparency
-    (crt.sh) + optional resolve. OWNED DOMAINS ONLY -- authorized OSINT lane. ATT&CK T1590/T1596.
-    move: domain."""
+    (crt.sh) + a DNS-brute lane for CT-invisible hosts + optional resolve. OWNED DOMAINS ONLY -- authorized
+    OSINT lane. ATT&CK T1590/T1596. move: domain."""
     dom = move.get("domain") or move.get("target") or ""
     if not dom or "." not in dom:
         return _res("external", False, "no owned domain (move['domain'])", technique="T1590")
@@ -188,12 +228,28 @@ def external(move, ctx):
     except Exception:
         for m in re.findall(rf"[a-z0-9_.-]+\.{re.escape(dom)}", out or "", re.I):
             subs.add(m.lower().lstrip("*."))
+    ct_count = len(subs)
+    brute = {}
+    if os.environ.get("AEGIS_DNS_BRUTE", "1") != "0":
+        brute = _dns_brute(dom)                       # owned-domain DNS-brute lane (catches CT-invisible hosts)
+        subs.update(brute.keys())
     subs.discard(dom)
+    # prioritise high-value names first so the loop fingerprints the likely crown jewels before filler
+    _HV = ("crm", "app", "portal", "admin", "erp", "api", "dashboard", "secure", "login", "internal", "vpn", "engineer")
+    def _prio(h):
+        lead = h.split(".", 1)[0]
+        for i, k in enumerate(_HV):
+            if k == lead or k in lead:
+                return (0, i, h)
+        return (1, 0, h)
+    ordered = sorted(subs, key=_prio)
     verified = len(subs) > 0
-    return _res("external", verified, f"{dom}: {len(subs)} subdomain(s) from CT logs",
-                severity="low", surface=dom, technique="T1590/T1596", items=sorted(subs)[:40],
-                evidence=[f"crt.sh returned {len(out)}b"],
-                next_moves=[{"action": "fingerprint", "target": s} for s in sorted(subs)[:3]])
+    return _res("external", verified,
+                f"{dom}: {len(subs)} subdomain(s) ({ct_count} from CT logs, {len(brute)} from DNS-brute)",
+                severity="low", surface=dom, technique="T1590/T1596", items=ordered[:40],
+                evidence=[f"crt.sh returned {len(out)}b",
+                          f"dns-brute resolved {len(brute)}/{len(_SUBDOMAIN_WORDLIST)} names"],
+                next_moves=[{"action": "fingerprint", "target": s} for s in ordered[:5]])
 
 
 def cred_harvest(move, ctx):

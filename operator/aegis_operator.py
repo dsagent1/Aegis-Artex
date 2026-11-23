@@ -203,6 +203,26 @@ def _advance_fallback() -> bool:
         _CTX["fallback_i"] = i   # remember we passed it, so we don't retry a keyless leg
     return False
 
+def _resolve_fallback(brain, model):
+    """Build the failover ladder for a run/chat. Explicit AEGIS_FALLBACK wins; otherwise the DeepSeek-direct
+    brain (ds/deepseek) DEFAULTS to a `ds-or` leg so a 402 Insufficient-Balance on api.deepseek.com fails OVER
+    to DeepSeek-over-OpenRouter instead of crashing. Drops chat-incompatible + keyless legs. Probing a leg
+    mutates AEGIS_PROVIDER, so the CALLER must re-apply the real starting brain after this returns.
+    Disable the implicit default with AEGIS_DS_AUTOFALLBACK=0."""
+    env = os.environ.get("AEGIS_FALLBACK", "").strip()
+    lad = [b.strip() for b in env.split(",") if b.strip()] if env else []
+    # DS brain: GUARANTEE a working DeepSeek failover leg (direct is 402 Insufficient-Balance, and an
+    # existing AEGIS_FALLBACK leg may itself point at the same dead endpoint). Append ds-or as the TERMINAL
+    # safety net if no DS-OR leg is already configured. Disable with AEGIS_DS_AUTOFALLBACK=0.
+    _dsor_names = {"ds-or", "dsor", "ds-openrouter", "deepseek-or", "deepseek-openrouter"}
+    if ((brain or "").strip().lower() in ("ds", "deepseek")
+            and os.environ.get("AEGIS_DS_AUTOFALLBACK", "1") != "0"
+            and not any(b.lower() in _dsor_names for b in lad)):
+        lad.append("ds-or")
+    lad = [b for b in lad if b.lower() not in _CHAT_LADDER_EXCLUDE]            # drop chat-incompatible legs
+    lad = [b for b in lad if _apply_brain(b, ds_model=model)[0] is not None]   # keep only credentialed legs
+    return lad
+
 def _create(client, **kw):
     """Failover wrapper around _create_once: on a provider rate-limit/quota/capacity error, advance the
     AEGIS_FALLBACK ladder (free-first -> CF) and retry with the next leg's client+model. Inert (single
@@ -1066,7 +1086,7 @@ def _chat_search(term):
 # groq + gemini are board-only (groq 413s on the full tools payload; gemini free-quota 429s).
 # kimi (/k2, /k2-code) RETIRED on Cloudflare 2026-11-20 -> dropped from the menu (aliases still resolve to
 # live fallbacks for back-compat). ds-cf = DeepSeek flash via Cloudflare -- the direct-DS failover channel.
-_BRAIN_CMDS = {"ds": ("/deepseek",), "ds-cf": ("/dscf", "/deepseek-cf"),
+_BRAIN_CMDS = {"ds": ("/deepseek",), "ds-cf": ("/dscf", "/deepseek-cf"), "ds-or": ("/dsor",),
                "qwen": ("/qw",), "scout": ("/llama4",), "llama": ("/l",),
                "cerebras": ("/cb",), "openrouter": ("/or",)}
 
@@ -2044,26 +2064,112 @@ def _append_ledger(entry):
         return {"error": repr(e)[:150]}
     return {"ok": True, "entries_this_run": sum(1 for e in led if e.get("run") == _RUN_ID)}
 
-def t_record_finding(title, severity="unknown", principal="", endpoint="", evidence="", status="confirmed"):
+def t_record_finding(title, severity="unknown", principal="", endpoint="", evidence="", status="confirmed",
+                     verify_method="", verify_body=None, verify_status=None, verify_body_regex=""):
     """Record ONE finding to the durable ledger the MOMENT you confirm it (do not wait for the report).
     Survives context compaction. severity=critical|high|medium|low|info; principal=who achieved it
     (unauth|technician|owner|external); status=confirmed|candidate|clean ('clean' = a vector you tested
-    that HELD, worth recording so the final report can say what was checked)."""
+    that HELD, worth recording so the final report can say what was checked).
+    PROOF REQUEST (so the ORACLE can VERIFY this out-of-band -- strongly recommended for any confirmed
+    exploit): give the exact request that PROVES it so the verifier can REPLAY it independently:
+    verify_method (GET/POST/...), endpoint (the path, e.g. /rest/user/login), verify_body (the JSON body
+    / injection payload, e.g. {"email":"' OR 1=1--","password":"x"}), and the SUCCESS SIGNAL -- verify_status
+    (e.g. 200) and/or verify_body_regex (a regex that MUST appear in a successful response, e.g.
+    "\\"authentication\\".*\\"token\\""). A finding with a proof request is re-fired at finish() and stamped
+    oracle-verified or oracle-rejected (ground truth). Without one it stays an unverifiable candidate."""
     res = _append_ledger({"kind": "finding", "title": str(title)[:200], "severity": severity,
                           "principal": principal, "endpoint": str(endpoint)[:200],
                           "evidence": str(evidence)[:600], "status": status})
-    # Also emit as a CANDIDATE into the oracle-gated store (verified separately, out-of-band).
+    # Build a REPLAYABLE proof request so the oracle can verify out-of-band (re-fire the exact exploit).
+    _vspec = None
+    if endpoint and (verify_status is not None or verify_body_regex or verify_method):
+        try:
+            _vb = verify_body
+            if isinstance(_vb, str) and _vb.strip():        # tolerate a JSON string body
+                try: _vb = json.loads(_vb)
+                except Exception: pass
+            _vspec = {"method": (str(verify_method) or "GET").upper(), "path": str(endpoint)[:200],
+                      "body": _vb, "expected_status": (int(verify_status) if verify_status is not None else None),
+                      "body_regex": (str(verify_body_regex) or None)}
+        except Exception:
+            _vspec = None
+    _cid = None
+    # Also emit as a CANDIDATE into the oracle-gated store (verified separately, out-of-band, at finish()).
     if _VF is not None:
         try:
-            _VF.record_candidate(_VFFinding(
+            _prov = {"provider": "deepseek", "principal": principal, "status_claimed": status}
+            if _vspec: _prov["verify_spec"] = _vspec
+            _cid = _VF.record_candidate(_VFFinding(
                 claim_type=str(title)[:60], summary=str(title)[:200], severity=severity,
                 run_id=_RUN_ID, evidence=[{"kind": "note", "detail": str(evidence)[:600]}],
                 coverage_tags=([f"surface:{str(endpoint)[:120]}"] if endpoint else []),
-                provenance={"provider": "deepseek", "principal": principal, "status_claimed": status}))
+                provenance=_prov))
         except Exception:
             pass
-    return json.dumps({"recorded": "finding", "title": title, **res,
-                       "note": "also recorded as a candidate in the oracle-gated store; run the verifier to confirm"})
+    return json.dumps({"recorded": "finding", "title": title, "finding_id": _cid, **res,
+                       "verifiable": bool(_vspec),
+                       "note": ("recorded as an oracle-gated CANDIDATE with a replayable proof request -- it "
+                                "will be re-fired and oracle-verified at finish()." if _vspec else
+                                "recorded as a CANDIDATE but WITHOUT a proof request -- it CANNOT be "
+                                "oracle-verified. Re-record with verify_method/endpoint/verify_body/"
+                                "verify_status/verify_body_regex so the oracle can confirm it.")})
+
+def _verify_run_candidates(run_only=True):
+    """OUT-OF-BAND VERIFICATION: for each recorded CANDIDATE that carries a replayable proof request,
+    re-fire that exact request against the live target via HttpOracle and TRANSITION it to verified /
+    rejected in the oracle-gated store (ground truth -- independent of the model's self-report; the
+    HttpOracle also guards against SPA catch-all false-positives). Returns a verdict summary. Never raises."""
+    if _VF is None:
+        return {"error": "verified-findings store unavailable", "candidates": 0, "verified": 0, "rejected": 0}
+    try:
+        from verified_findings import Verifier as _Verifier, HttpOracle as _HttpOracle
+    except Exception as e:
+        return {"error": f"verifier import failed: {repr(e)[:120]}", "candidates": 0, "verified": 0, "rejected": 0}
+    base = (os.environ.get("AEGIS_TARGET") or os.environ.get("AEGIS_TARGET_BASE") or "").rstrip("/")
+    verifier = _Verifier(_VF)
+    results = []
+    try:
+        _items = list(_VF.findings().items())
+    except Exception as e:
+        return {"error": f"store read failed: {repr(e)[:120]}", "candidates": 0, "verified": 0, "rejected": 0}
+    for fid, fd in _items:
+        if (fd.get("status") or "") != "candidate":
+            continue
+        if run_only and (fd.get("run_id") not in ("", None, _RUN_ID)):
+            continue
+        spec = (fd.get("provenance") or {}).get("verify_spec")
+        claim = (fd.get("summary") or fd.get("claim_type") or "")[:80]
+        if not spec:
+            results.append({"finding_id": fid, "claim": claim, "verdict": "unverifiable",
+                            "note": "no replayable proof request recorded"})
+            continue
+        path = str(spec.get("path") or "")
+        if not base or not path:
+            results.append({"finding_id": fid, "claim": claim, "verdict": "no-target",
+                            "note": "AEGIS_TARGET and endpoint are both required to replay"})
+            continue
+        oracle = _HttpOracle(base, spec.get("method", "GET"),
+                             path if path.startswith("/") else "/" + path,
+                             json_body=spec.get("body"), expected_status=spec.get("expected_status"),
+                             body_regex=(spec.get("body_regex") or None), oracle_id="copilot-verify@0")
+        try:
+            fdv = verifier.verify(fid, oracle)
+            results.append({"finding_id": fid, "claim": claim, "verdict": fdv.get("status"),
+                            "receipt": {k: (fdv.get("oracle_receipt") or {}).get(k)
+                                        for k in ("status_code", "spa_fallback", "checked")}})
+        except Exception as e:
+            results.append({"finding_id": fid, "claim": claim, "verdict": "error", "error": repr(e)[:160]})
+    v = sum(1 for r in results if r.get("verdict") == "verified")
+    rej = sum(1 for r in results if r.get("verdict") == "rejected")
+    return {"candidates": len(results), "verified": v, "rejected": rej, "base": base, "results": results}
+
+def t_verify_findings():
+    """Run the OUT-OF-BAND ORACLE over this run's recorded candidates: re-fire each one's proof request
+    against the live target and stamp it oracle-VERIFIED or oracle-REJECTED (ground truth, not self-report).
+    Only candidates recorded WITH a proof request (record_finding's verify_* args) can be verified. Call this
+    after you've recorded a confirmed exploit to PROVE it; it also runs automatically at finish()."""
+    out = _verify_run_candidates(run_only=True)
+    return json.dumps(out)
 
 def t_chain_state(gained="", next_step="", note=""):
     """Record exploit-CHAIN progress: what access/privilege you currently HOLD (gained), the next pivot
@@ -2303,7 +2409,14 @@ def t_run_in_kali(command):
         # stdin=DEVNULL: same worker-thread stdin-inheritance hang as t_run_command (and `wsl ... bash -lc`
         # would otherwise consume the operator's interactive stdin). run_in_kali is the workhorse blocking
         # tool in real hunts, so this is the one that matters most.
-        p = subprocess.run(["wsl", "-d", "kali-linux", "-u", "root", "--", "bash", "-lc", command],
+        # BUGFIX: an inline `bash -lc "<script>"` has its `$` MANGLED by wsl.exe's Windows->WSL argv marshaling,
+        # so shell loops/variables silently COLLAPSE (`for u in ...; echo $u` -> empty). We therefore ship the
+        # script as base64 in the argv (no `$` survives into argv until it is decoded INSIDE Kali), write it to
+        # a file, and exec that file. stdin stays DEVNULL, so child-process stdin semantics are unchanged.
+        import base64
+        _enc = base64.b64encode(command.encode("utf-8", "replace")).decode("ascii")
+        _wrap = "echo " + _enc + " | base64 -d > /tmp/.aegis_rik.sh && bash /tmp/.aegis_rik.sh"
+        p = subprocess.run(["wsl", "-d", "kali-linux", "-u", "root", "--", "bash", "-lc", _wrap],
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240,
                            stdin=subprocess.DEVNULL)
         return json.dumps({"stdout": p.stdout[-4000:], "stderr": p.stderr[-1000:], "rc": p.returncode})
@@ -2714,6 +2827,73 @@ def t_verify_fix_on_mirror(transport="wsl", mirror_repo="", repro_map="", allow_
 def _spec(name, desc, props, required):
     return {"type": "function", "function": {"name": name, "description": desc,
             "parameters": {"type": "object", "properties": props, "required": required}}}
+
+# CONTENT DISCOVERY: a fixed, high-signal list of UNLINKED endpoints common to PHP/web apps. NOT a wordlist
+# scanner -- ~55 curated names that return in seconds, so a near-empty surface (stub index, no links) still
+# yields its real endpoints (e.g. admin.php behind a 401) instead of being mislabelled "hardened".
+_DISCOVERY_PATHS = (
+    "admin.php","administrator.php","admin/","administrator/","login.php","signin.php","auth.php",
+    "config.php","configuration.php","settings.php","db.php","database.php","dbconfig.php",
+    "api.php","api/","upload.php","uploads.php","dashboard.php","panel.php","cp.php","manage.php",
+    "manager.php","console.php","user.php","users.php","account.php","accounts.php","profile.php",
+    "install.php","setup.php","backup.php","backup.zip","test.php","info.php","phpinfo.php","p.php",
+    "index.php","app.php","app_dev.php","web/app.php","adminer.php","phpmyadmin/","server-status",
+    "server-info",".env","config.php.bak","admin.php.bak",".git/HEAD","robots.txt",
+    "admin","login","dashboard","portal","api",
+)
+
+def t_content_discovery(base_url, extra_paths=None, timeout=6, workers=16):
+    """ONE-SHOT curated content discovery: probe a fixed high-value endpoint list (admin.php, login.php,
+    config.php, api.php, ... + front controllers + sensitive files) in PARALLEL inside Kali and return only
+    the REAL ones (non-404). NOT a wordlist scanner -- a ~55-entry high-signal list that returns in seconds.
+    Use it FIRST on a near-empty/stub surface, then ATTACK each non-404: a 401/403 is an auth control to
+    BYPASS; a 200 is logic/injection to exploit. extra_paths adds app-specific guesses."""
+    import base64 as _b64, shlex as _shlex
+    if not re.match(r'^https?://', str(base_url), re.I):
+        return json.dumps({"error": "only http(s) URLs allowed"})
+    base = str(base_url).replace('"', '').replace('$', '').replace("'", "").rstrip('/')
+    paths = list(_DISCOVERY_PATHS)
+    if extra_paths:
+        extra_paths = [extra_paths] if isinstance(extra_paths, str) else list(extra_paths)
+        paths += [str(p) for p in extra_paths]
+    seen = set(); urls = []
+    for p in paths:
+        pp = str(p) if str(p).startswith('/') else '/' + str(p)
+        full = base + pp
+        if full not in seen:
+            seen.add(full); urls.append(full)
+    # Parallel curl via xargs -P, shipped as base64 (wsl.exe argv eats '$', so loops/subshells must go via a
+    # decoded script file -- same fix as run_in_kali). @@ is the xargs replstr; URLs never contain it.
+    quoted = " ".join(_shlex.quote(u) for u in urls)
+    script = ("printf '%s\\n' " + quoted + " | xargs -P " + str(int(workers)) + " -I@@ sh -c "
+              "'printf \"%s %s\\n\" \"@@\" \"$(curl -s -o /dev/null -w \"%{http_code}:%{size_download}\" -m "
+              + str(int(timeout)) + " \"@@\")\"'")
+    try:
+        enc = _b64.b64encode(script.encode("utf-8", "replace")).decode("ascii")
+        wrap = "echo " + enc + " | base64 -d > /tmp/.aegis_disc.sh && bash /tmp/.aegis_disc.sh"
+        p = subprocess.run(["wsl", "-d", "kali-linux", "-u", "root", "--", "bash", "-lc", wrap],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=int(timeout) * 4 + 30, stdin=subprocess.DEVNULL)
+        out = p.stdout or ""
+    except Exception as e:
+        return json.dumps({"error": repr(e)[:200]})
+    results = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        u, _, cs = line.rpartition(" ")
+        code, _, size = cs.partition(":")
+        if u.startswith(base):
+            results.append({"path": u[len(base):] or "/", "code": code.strip(), "size": size.strip()})
+    live = [r for r in results if r["code"] not in ("404", "000", "", "ERR")]
+    _rank = {"200": 0, "401": 1, "403": 2, "500": 3, "302": 4, "301": 4, "405": 5}
+    live.sort(key=lambda r: _rank.get(r["code"], 9))
+    return json.dumps({"base": base, "probed": len(urls), "live_count": len(live), "live": live,
+                       "note": ("Non-404 endpoints are REAL -- attack each now. 401/403 = an auth/authorization "
+                                "control to BYPASS (missing/forgeable header, cookie, token, or param; "
+                                "type-juggling on the check). 200 = logic/injection to exploit. Stay on the "
+                                "highest-value endpoint (admin/login/api) until its bypass is driven to a result.")})
 
 # ================= TARGET MIRRORING (fingerprint an external stack -> local twin) =================
 # Adds a "test the target" vs "test a local mirror of the target" choice. --target-mode selects it.
@@ -3180,9 +3360,18 @@ TOOLS = {
     "Record ONE confirmed/candidate finding to the durable LEDGER the moment you confirm it (do NOT wait for the "
     "final report). It SURVIVES context compaction, so nothing is lost on long runs. severity=critical|high|medium|"
     "low|info; principal=who achieved it (unauth|technician|owner|external); status=confirmed|candidate|clean "
-    "('clean' records a vector you tested that HELD). Then write the report FROM read_ledger().",
+    "('clean' records a vector you tested that HELD). For a confirmed EXPLOIT, ALSO pass the PROOF REQUEST so the "
+    "ORACLE can verify it out-of-band: verify_method, endpoint (path), verify_body (JSON body / injection payload), "
+    "and the success signal verify_status and/or verify_body_regex (regex that MUST appear on success). It is then "
+    "re-fired at finish() and stamped oracle-verified/rejected. Then write the report FROM read_ledger().",
     {"title": {"type": "string"}, "severity": {"type": "string"}, "principal": {"type": "string"},
-     "endpoint": {"type": "string"}, "evidence": {"type": "string"}, "status": {"type": "string"}}, ["title"])),
+     "endpoint": {"type": "string"}, "evidence": {"type": "string"}, "status": {"type": "string"},
+     "verify_method": {"type": "string"}, "verify_body": {"type": "object"},
+     "verify_status": {"type": "integer"}, "verify_body_regex": {"type": "string"}}, ["title"])),
+ "verify_findings": (t_verify_findings, True, _spec("verify_findings",
+    "Run the OUT-OF-BAND ORACLE over this run's recorded candidates: re-fire each one's proof request against the "
+    "live target and stamp it oracle-VERIFIED or oracle-REJECTED (ground truth, not self-report). Only candidates "
+    "recorded WITH a proof request can be verified. Also runs automatically at finish().", {}, [])),
  "chain_state": (t_chain_state, True, _spec("chain_state",
     "Record exploit-CHAIN progress to the durable LEDGER: what access/privilege you HOLD (gained), the next pivot "
     "(next_step), and linking detail (note). Call it EACH time you gain access or complete a pivot, so a multi-stage "
@@ -3267,6 +3456,14 @@ TOOLS = {
     "bounded=true for the tight-caps A/B. Returns the objective status + the sub-task graph.",
     {"objective": {"type": "string"}, "verification": {"type": "string"},
      "bounded": {"type": "boolean"}, "exec_max_iter": {"type": "integer"}}, ["objective"])),
+ "content_discovery": (t_content_discovery, True, _spec("content_discovery",
+    "ONE-SHOT curated content discovery: probes a fixed ~55-entry high-value endpoint list (admin.php, "
+    "login.php, config.php, api.php, front controllers, sensitive files) in PARALLEL via Kali and returns "
+    "only the non-404 REAL endpoints, ranked. NOT a wordlist scanner -- returns in seconds. Use FIRST on a "
+    "near-empty/stub surface, then attack each non-404 (401/403 = auth control to bypass; 200 = logic). "
+    "extra_paths adds app-specific guesses.",
+    {"base_url": {"type": "string"}, "extra_paths": {"type": "array", "items": {"type": "string"}}},
+    ["base_url"])),
  "fingerprint_target": (t_fingerprint_target, False, _spec("fingerprint_target",
     "LIGHT non-intrusive fingerprint of an external target (server/language/CMS+version/plugins, PHP/Symfony "
     "exposures) via Kali (VPN egress). Writes a manifest for provision_twin. Safe recon -- no exploitation.",
@@ -3538,6 +3735,11 @@ CEREBRAS_MODEL = os.environ.get("AEGIS_CEREBRAS_MODEL", "gpt-oss-120b")   # fast
 GEMINI_MODEL = os.environ.get("AEGIS_GEMINI_MODEL", "gemini-3.8-flash")   # free-tier Flash via the OpenAI-compat endpoint
 GROQ_MODEL = os.environ.get("AEGIS_GROQ_MODEL", "openai/gpt-oss-120b")    # Groq free tier (no card); confirm via GET /openai/v1/models
 OPENROUTER_MODEL = os.environ.get("AEGIS_OPENROUTER_MODEL", "qwen/qwen3.8-27b:free")  # tool-capable :free; free slugs rotate/throttle -- confirm at openrouter.ai/models?max_price=0
+# DS-OR: DeepSeek driven over OpenRouter (the WORKING DeepSeek path -- api.deepseek.com direct is 402
+# Insufficient-Balance). Pins a DeepSeek slug onto the openrouter provider so /ds-or == DeepSeek, distinct
+# from /or (generic OpenRouter, defaults to the qwen :free slug). Use the CHAT slug, NOT r1/reasoning --
+# reasoning DeepSeek emits empty `content` in the tool-loop. Override the slug with AEGIS_OPENROUTER_DS_MODEL.
+OPENROUTER_DS_MODEL = os.environ.get("AEGIS_OPENROUTER_DS_MODEL", "deepseek/deepseek-chat")
 # Brains that MUST NOT be a chat failover-ladder leg: they can't drive the interactive tool-loop (groq 413s
 # on the full tools payload; gemini free-tier 429s). Board-only. run_chat strips these from AEGIS_FALLBACK.
 _CHAT_LADDER_EXCLUDE = {"groq", "gemini", "gem", "flash"}
@@ -3561,7 +3763,8 @@ _BRAIN_CANON = {"ds-cf": "deepseek-cf", "dscf": "deepseek-cf", "deepseek-v4.1-fl
                 "qwen3": "qwen", "qwen3-30b": "qwen",
                 "scout": "scout", "llama4": "scout", "llama-4": "scout",
                 "llama3": "llama", "llama-3.3": "llama",
-                "cb": "cerebras", "gem": "gemini", "flash": "gemini", "or": "openrouter"}
+                "cb": "cerebras", "gem": "gemini", "flash": "gemini", "or": "openrouter",
+                "dsor": "ds-or", "ds-openrouter": "ds-or", "deepseek-or": "ds-or", "deepseek-openrouter": "ds-or"}
 
 def _load_cf_models():
     """The full CF roster (name -> @cf/... slug) from cf_models.json, so ANY CF model is usable as a
@@ -3694,6 +3897,16 @@ def _apply_brain(name, ds_model=None):
             return None, None, "GROQ unavailable (set GROQ_API_KEY -- free at console.groq.com)"
         mdl = os.environ.get("AEGIS_GROQ_MODEL", GROQ_MODEL)
         return OpenAI(api_key=key, base_url=endpoint), mdl, f"GROQ ({mdl})"
+    if n in ("ds-or", "dsor", "ds-openrouter", "deepseek-or", "deepseek-openrouter"):
+        # DeepSeek driven over OpenRouter -- the WORKING DeepSeek path (api.deepseek.com direct is 402
+        # Insufficient-Balance). Pins a DeepSeek slug onto the openrouter provider; IGNORES ds_model (that is
+        # a direct-DeepSeek id, not an OpenRouter slug). This is the default failover leg for the `ds` brain.
+        os.environ["AEGIS_PROVIDER"] = "openrouter"
+        key, endpoint = _resolve_key_endpoint()
+        if not key:
+            return None, None, "DS-OR unavailable (set OPENROUTER_API_KEY)"
+        mdl = os.environ.get("AEGIS_OPENROUTER_DS_MODEL", OPENROUTER_DS_MODEL)
+        return OpenAI(api_key=key, base_url=endpoint), mdl, f"DS-OR ({mdl})"
     if n in ("openrouter", "or"):
         os.environ["AEGIS_PROVIDER"] = "openrouter"
         key, endpoint = _resolve_key_endpoint()
@@ -3771,10 +3984,31 @@ def _brevity_preface():
             "preamble or a closing summary. Lead with the answer/result and stop; drop filler. This governs "
             "prose replies ONLY -- it never shortens or suppresses a tool call.\n")
 
+# EXECUTION / KILL DISCIPLINE -- OPERATIONAL guidance (NOT the safety _DOCTRINE, which is left untouched).
+# Fixes the observed co-pilot failure mode: great at finding the lead, chronically fails to execute the
+# kill -- it writes custom probe scripts that break, narrates "next I would...", and hits the iteration
+# limit still in recon. This forces: simplest-probe-first, exploit-the-primitive-NOW, and no finish() from
+# the recon phase with unused leads. Appended after _DOCTRINE in every system-prompt assembly.
+_KILL_DISCIPLINE = """
+
+EXECUTION DISCIPLINE (you are scored on VERIFIED kills, not on recon):
+- A lead is worth ZERO until you have FIRED the exploit and checked the oracle. Finding a weakness is half the job; PROVING it with a real response is the job. Recon that you never act on is wasted budget.
+- Simplest probe that answers the question wins. Fire ONE direct run_command (a single curl / HTTP request) BEFORE you ever write a script. NEVER write a helper script to do what one request can do -- your custom tooling breaks (bad signatures, env assumptions) and burns the budget you needed for the kill.
+- The instant you confirm a primitive -- a leaked secret, an injectable parameter, an auth-bypass vector, an exposed debug endpoint -- your VERY NEXT tool call MUST be the exploitation attempt that uses it, checked against the oracle. Not a plan. Not more recon. Not a script. Exploit first, tidy up after.
+- Never end a step with "next I would..." / "the next step is...". If you can name the next action, DO it this step.
+- Budget law: once you are past HALF your iterations without a verified kill, STOP exploring. Pick the single highest-value confirmed lead and spend every remaining step driving it to a verified result with direct requests.
+- NO exhaustive scanners in a budget-limited run: never launch a full feroxbuster/gobuster/dirb wordlist, a full-port nmap, or a full nuclei sweep -- ONE such tool eats your entire budget. Use TARGETED probes: curl a handful of likely paths, hit the known endpoint with the specific payload. If you must run a tool, cap it hard (small wordlist, --timeout, -t low) so it returns in well under a minute.
+- CONTENT DISCOVERY on a near-empty surface: if the root and your guessed paths return only a stub/placeholder with no links, the real endpoints are UNLINKED -- do NOT conclude "hardened" from extensionless guesses (/admin, /login) alone. Call the content_discovery(base_url) TOOL -- it probes the whole curated high-value endpoint list in ONE parallel pass and returns the non-404s. Do NOT hand-roll dozens of one-at-a-time curls (that burns your whole budget on discovery); do NOT loop via run_command (that is the Windows shell). Any non-404 (200/401/403/500) is a REAL endpoint.
+- STAY ON THE CROWN JEWEL: the instant content_discovery surfaces a high-value endpoint (admin.php, login.php, api, a 401/403), LOCK ONTO IT and drive the bypass to a verdict before probing anything else -- a 401/403 is an auth/authorization control to BYPASS (missing/forgeable header, cookie, token, or param; type-juggling on the check; default/weak creds). Run through the bypass techniques back-to-back on that one endpoint. Do NOT wander back to discovering more endpoints until you have genuinely exhausted the bypasses on the crown jewel. Finding admin.php behind a 401 and walking away is NOT exhausting the surface.
+- Known-CVE probes are only the FIRST pass. A custom web app that shrugs off version/CVE payloads is NOT an exhausted surface -- the app's OWN logic is the real target. Before you treat a web target as exhausted you MUST have exercised the application itself: its AUTH/login flow (auth-bypass, type-juggling/array-injection on the REAL login fields, default/weak creds), SESSION + ACCESS CONTROL (IDOR on real object ids, forced-browse to privileged routes, missing authz), and INJECTION (SQLi/command/SSTI) in the app's REAL parameters and forms -- not canned CVE payloads against generic paths. "No public CVE fired" is a recon result, never a verdict.
+- finish() is valid ONLY after (a) a verified kill, or (b) a GENUINELY exhausted surface: you have ATTEMPTED the exploit on EVERY confirmed lead AND, for a web app, actually tested its own auth / access-control / injection logic (above) -- not merely run the known-CVE list. Do NOT finish() from recon, or from a known-CVE sweep, with the app's own logic untested.
+"""
+
 def _build_chat_system():
-    """Compose the full chat system prompt from the current context (identity + brevity + doctrine + skill +
-    addendum + mode policy + memory + ledger). Rebuilt at chat start and on every live brain swap."""
-    return (SYSTEM + _identity_preface() + _brevity_preface() + _DOCTRINE + _skill_preface()
+    """Compose the full chat system prompt from the current context (identity + brevity + doctrine +
+    kill-discipline + skill + addendum + mode policy + memory + ledger). Rebuilt at chat start and on
+    every live brain swap."""
+    return (SYSTEM + _identity_preface() + _brevity_preface() + _DOCTRINE + _KILL_DISCIPLINE + _skill_preface()
             + CHAT_SYSTEM_ADDENDUM + _mode_policy(TARGET_MODE) + _memory_preface() + _ledger_block())
 
 _CTX = {}  # shared agent context (client/model/thinking/gate/depth) for sub-agents
@@ -4011,6 +4245,16 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
     interacted_since_record = False   # target-interaction happened since the last ledger write
     mutated_unverified = False        # a file was edited but not yet exercised/verified (verify-before-finish)
     verify_nudged = False             # the verify-before-finish nudge has fired once (don't loop on it)
+    script_pending = None             # KILL-GATE: a probe/exploit script was WRITTEN but not yet executed
+    kill_nudged = False               # the execute-before-finish (kill) nudge has fired once
+    finding_recorded = False          # RECORD-GATE: a record_finding wrote a finding this run (candidate or verified).
+                                      # The co-pilot's record_finding stores a CANDIDATE (oracle verifies out-of-band),
+                                      # so "recorded" -- not an inline "verified" status -- is what satisfies the gate.
+    record_nudged = False             # the record-before-finish nudge has fired once
+    urgency_nudged = False            # the budget-urgency (drive the kill) nudge has fired once
+    board_rescues = 0                 # BOARD-RESCUE circuit-breaker: times the board was pulled on a strategic stall
+    _BOARD_MAX_RESCUES = 2            # cap board interventions so it stays an ADVISOR, never a crutch or a gate
+    _BOARD_STALL_WINDOW = 7           # interaction-turns with NO new ledger progress that count as "stalled"
     # brain escalation ladder flash -> pro -> gpt-oss: start on `model`; bump a rung when stuck (loop-guard).
     # Rungs 1-2 swap the driving brain; rung 3 auto-consults the gpt-oss-120b helper (once) and feeds it back.
     cur_model = model
@@ -4063,6 +4307,39 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                              "Call write_todos to lay out the remaining steps (one item in_progress), then continue."})
             plan_nudged = True
         turns_since_record += 1
+        # BOARD-RESCUE (circuit-breaker, ADVISORY -- never a gate): the board never blocks DS, but when DS is
+        # STALLED -- interacting for several steps with no new ledger progress (stuck looping, or probing a
+        # surface that goes nowhere) -- pull the board ONCE for a concrete DIFFERENT approach and inject it to
+        # execute. Distinct from the identical-repeat loop-guard (which escalates the single driving brain):
+        # this fires on STRATEGIC stall and brings a different ANGLE. Rate-limited; never waits on the board
+        # (the helper carries its own timeout and skips cleanly if the board is unreachable).
+        if (depth == 0 and not chat and interacted_since_record
+                and board_rescues < _BOARD_MAX_RESCUES and turns_since_record >= _BOARD_STALL_WINDOW):
+            _parts = []
+            try: _parts.append("OBJECTIVE: " + _flatten_msg(messages[1])[:600])
+            except Exception: pass
+            try: _parts.append("RECENT STATE:\n" + _flatten_msg(messages[-1])[:1500])
+            except Exception: pass
+            _dir = None
+            try:
+                _draw = t_cf_helper(
+                    "An authorized security operator is STALLED -- it has been interacting with the target for "
+                    "several steps without confirming new progress toward its objective (stuck in a loop, or "
+                    "probing a surface that leads nowhere). Give ONE concrete, DIFFERENT next move it can "
+                    "EXECUTE immediately: a specific request, technique, surface, or tool it has NOT already "
+                    "tried -- not a rephrase of what already failed. Be specific and actionable.",
+                    "\n".join(_parts))
+                _dir = (json.loads(_draw).get("answer") or "").strip()[:2500]
+            except Exception as e:
+                _p(f"{tag} [board-rescue] board unavailable ({repr(e)[:50]}) -- continuing unblocked\n", flush=True)
+            board_rescues += 1
+            turns_since_record = 0   # fresh window: let DS act on the direction before this can re-fire
+            if _dir:
+                _p(f"{tag} [board-rescue] stalled -> board direction injected (#{board_rescues})\n", flush=True)
+                messages.append({"role": "user", "content":
+                    "[BOARD RESCUE -- you appear STALLED (interacting without new progress). The board proposes a "
+                    "DIFFERENT approach below. EXECUTE it this step unless you hold a clearly better CONFIRMED "
+                    "lead; do NOT re-run what already failed]:\n" + _dir})
         if interacted_since_record and turns_since_record >= 10 and depth == 0 and not chat:
             messages.append({"role": "user", "content": "RECORD-AS-YOU-GO reminder: you've run several "
                              "target-interaction steps without calling record_finding/chain_state. Anything left "
@@ -4078,12 +4355,23 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                              "step ACTUALLY work -- check the tool result, don't assume? If something failed "
                              "transiently, retry or route around it; if an approach is stuck, change it. Then act "
                              "or finish()."})
-        # STICK AFTER FAILOVER: if a prior turn's _create advanced the AEGIS_FALLBACK ladder, _CTX now holds
-        # the new client+model. Adopt them so THIS and every later turn use the failed-over provider instead of
-        # re-calling the dead one (which would 402/crash again). Fires once post-failover (then _CTX["client"]
-        # == client, so it's inert and never disturbs the normal / sub-model-escalation path).
-        if _CTX.get("client") is not None and _CTX.get("client") is not client:
-            client = _CTX["client"]; cur_model = _CTX.get("model", cur_model)
+        # BUDGET-URGENCY (kill-gate): past 2/3 of the iteration budget, force a shift from exploring to
+        # closing -- drive the single best lead to a verified result; fires once.
+        if (depth == 0 and not chat and not urgency_nudged and max_iter >= 6
+                and i >= (max_iter * 2) // 3):
+            messages.append({"role": "user", "content": f"BUDGET ALERT: {max_iter - i + 1} of {max_iter} steps "
+                "left. STOP exploring. Pick your SINGLE highest-value confirmed lead and drive it to a VERIFIED "
+                "result with DIRECT requests this step -- if you wrote a probe/exploit script, RUN it now. Do not "
+                "open new recon threads; close the one you have."})
+            urgency_nudged = True
+        # FAILOVER SYNC: if a prior _create() failed OVER to a ladder leg (e.g. DS 402 -> DS-OR), _CTX now
+        # holds the new client+model. Adopt them so this iteration doesn't reuse the stale (dead) local
+        # client and re-trigger the ladder on every call -- which exhausts it and crashes. The chat loop
+        # already re-reads _CTX each turn; this gives the task loop the same behaviour.
+        if (_CTX.get("fallback_i", -1) >= 0 and _CTX.get("client") is not None
+                and _CTX["client"] is not client):
+            client = _CTX["client"]
+            cur_model = _CTX.get("model", cur_model)
         _mt = _think_max if thinking else (_pro_max if cur_model != _BRAIN_LADDER[0] else _base_max)
         kw = dict(model=cur_model, messages=messages, tools=specs, tool_choice="auto",
                   temperature=0.2, max_tokens=_mt)
@@ -4315,10 +4603,15 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
             elif name in ("run_in_kali", "run_command", "run_background", "fetch_url", "render_page", "run_tool", "run_wrapped_tool"):
                 interacted_since_record = True
                 mutated_unverified = False   # an exercise/verify step -> a prior edit is now being tested
+                script_pending = None        # KILL-GATE: an execution happened -> no unrun script dangling
             try:
                 args = json.loads(tc.function.arguments or "{}")
             except Exception:
                 args = {}
+            if name in ("write_file", "apply_edit"):          # KILL-GATE: a probe/exploit script written but not run
+                _wp = str(args.get("path") or args.get("file") or "")
+                if _wp.endswith((".sh", ".py", ".php", ".pl", ".rb")):
+                    script_pending = _wp
             entry = TOOLS.get(name)
             if entry is None or name not in allowed_names:
                 result = json.dumps({"error": f"tool not available here: {name}"})
@@ -4434,6 +4727,15 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
             except Exception:
                 pass
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": _frame_tool_output(_tool_content)})
+            if name == "record_finding":   # RECORD-GATE: a finding was durably recorded (candidate or verified)
+                try:
+                    _rr = json.loads(result)
+                    if isinstance(_rr, dict) and ("error" not in _rr) and (
+                            _rr.get("recorded") == "finding"
+                            or str(_rr.get("status") or _rr.get("verdict") or "").lower() in ("verified", "recorded")):
+                        finding_recorded = True
+                except Exception:
+                    pass
             if _stop_task:   # operator /stop'd during the tool; result is recorded, now end the task cleanly
                 _emit("STOP", "task ended at your request")
                 return None
@@ -4449,11 +4751,63 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                         "already verified, say how in the summary."})})
                     _p(f"{tag} [verify-before-finish] nudged the agent to verify its edits\n", flush=True)
                     continue   # don't return the finish yet
+                # KILL-GATE (execute-before-finish): you wrote a probe/exploit script but never ran it. A
+                # script you don't execute proves nothing. Nudge ONCE; then honour the next finish().
+                if script_pending and not kill_nudged and not chat:
+                    kill_nudged = True
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({
+                        "execute_before_finish": True, "note": f"You wrote {script_pending} but NEVER executed it "
+                        "-- an unrun script proves nothing and leaves your highest-value lead untested. Run it NOW "
+                        "(or fire the equivalent direct request) and check the result against the oracle, THEN "
+                        "finish(). If you already have the result, cite the actual response in your summary."})})
+                    _p(f"{tag} [execute-before-finish] nudged the agent to RUN its probe before finishing\n", flush=True)
+                    continue   # don't return the finish yet
+                # RECORD-GATE (verify-before-CLAIM): the summary asserts a verified/confirmed KILL, but NO
+                # record_finding produced an oracle-VERIFIED result this run. Self-reported "oracle-confirmed"
+                # is a hallucination -- only the oracle verifies (ground-truth doctrine). Challenge ONCE: call
+                # record_finding with the real evidence and let the oracle rule; if it REJECTS, say so honestly.
+                if not finding_recorded and not record_nudged and not chat:
+                    _claim = args.get("summary", "") if isinstance(args, dict) else ""
+                    if re.search(r"\b(verif|confirm|oracle|exploit|bypass|compromis|gained?\s+\w*\s*access|"
+                                 r"admin\s+(access|privile)|jwt|token|auth\w*\s*bypass|critical|kill)\b",
+                                 str(_claim), re.I):
+                        record_nudged = True
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({
+                            "record_before_finish": True, "note": "Your summary claims a confirmed / exploited / "
+                            "'oracle-confirmed' result, but you have NOT recorded any finding this run. Call "
+                            "record_finding NOW -- and include the PROOF REQUEST so the oracle can VERIFY it at "
+                            "finish: verify_method, endpoint (path), verify_body (the exact injection payload / "
+                            "body), and the success signal verify_status and/or verify_body_regex (a regex that "
+                            "MUST appear on success, e.g. the token field). The oracle will RE-FIRE it and stamp "
+                            "verified/rejected -- do NOT assert 'oracle-confirmed' yourself (self-report is not "
+                            "ground truth). THEN finish()."})})
+                        _p(f"{tag} [record-before-finish] agent claimed a kill with no oracle-verified finding -- nudged to record+verify\n", flush=True)
+                        continue   # don't return the finish yet
                 summ = json.loads(result).get("summary", "") or ""
                 if not summ.strip():  # fall back to the last thing the agent said
                     for prev in reversed(messages):
                         if prev.get("role") == "assistant" and prev.get("content"):
                             summ = prev["content"]; break
+                # OUT-OF-BAND ORACLE at finish: re-fire every recorded candidate's proof request against the
+                # live target and stamp it verified/rejected (ground truth). Append the verdict to the summary
+                # so the FINAL reflects the ORACLE, not the model's self-report (doctrine: only oracle-verified
+                # counts). depth==0 only (sub-agents don't own the ledger); best-effort, never blocks the finish.
+                if depth == 0 and not chat and _VF is not None:
+                    try:
+                        _vr = _verify_run_candidates(run_only=True)
+                        if _vr.get("candidates"):
+                            _lines = [f"  - [{r.get('verdict','?').upper()}] {r.get('claim','')}"
+                                      for r in _vr.get("results", [])]
+                            _p(f"{tag} [oracle] out-of-band verification: {_vr.get('verified',0)} verified, "
+                               f"{_vr.get('rejected',0)} rejected, of {_vr['candidates']} candidate(s)\n", flush=True)
+                            summ += ("\n\n=== ORACLE VERIFICATION (out-of-band, ground truth) ===\n"
+                                     f"{_vr.get('verified',0)} VERIFIED / {_vr.get('rejected',0)} REJECTED "
+                                     f"of {_vr['candidates']} recorded candidate(s):\n" + "\n".join(_lines))
+                            if _vr.get("verified", 0) == 0:
+                                summ += ("\n(NOTE: no finding was oracle-verified -- do not report this as a "
+                                         "confirmed/verified kill; the exploit claim is UNVERIFIED by ground truth.)")
+                    except Exception as _e:
+                        _p(f"{tag} [oracle] finish-verify skipped: {repr(_e)[:80]}\n", flush=True)
                 return summ
     # GUARDRAIL: max_iter reached WITHOUT finish() -- don't drop the work on the floor.
     # Force a best-effort, tool-less summary of what was accomplished / FOUND so far, so
@@ -4466,10 +4820,16 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                 "tools. In plain text, honestly summarize what you accomplished and what you FOUND so "
                 "far (with concrete evidence / HTTP status codes), what remains unfinished, and WHERE "
                 "you stopped. Do not fabricate."})
-            kw = dict(model=model, messages=messages, temperature=0.2, max_tokens=1200)
+            # Use the failover-synced client+model: if the run failed OVER (e.g. DS 402 -> DS-OR), the
+            # original `model`/`client` are stale -- sending `deepseek-flash` to the OpenRouter endpoint
+            # 400s ("not a valid model ID") and the summary is lost. _CTX holds the live leg.
+            _s_cl, _s_md = client, model
+            if _CTX.get("fallback_i", -1) >= 0 and _CTX.get("client") is not None:
+                _s_cl, _s_md = _CTX["client"], _CTX.get("model", model)
+            kw = dict(model=_s_md, messages=messages, temperature=0.2, max_tokens=1200)
             if extra_body is not None:
                 kw["extra_body"] = extra_body
-            resp = _create(client, **kw)   # no tools -> must answer in text
+            resp = _create(_s_cl, **kw)   # no tools -> must answer in text
             final = (resp.choices[0].message.content or "").strip()
             if final:
                 _p(f"{tag} [max_iter reached -- forced best-effort summary]\n", flush=True)
@@ -4497,12 +4857,10 @@ def _banner(model, endpoint, gate, mode="autonomous"):
 
 def run(task_text, model, thinking, max_iter, gate, remediate_on_finish=False):
     brain = _CTX.get("brain") or os.environ.get("AEGIS_BRAIN", "ds")
+    # Failover ladder (on error only): probe legs FIRST (this mutates AEGIS_PROVIDER), then apply the real
+    # starting brain LAST so the run begins on `brain`. DS defaults to a ds-or leg (402 -> DeepSeek-over-OR).
+    _lad = _resolve_fallback(brain, model)
     _ds_model = model or os.environ.get("AEGIS_MODEL", "deepseek-flash")
-    # Failover ladder (parity with --chat/run_chat): AEGIS_FALLBACK -> on a provider 402/quota/TPM/5xx the
-    # one-shot --task driver fails OVER to the next credentialed leg instead of CRASHING. Empty -> inert.
-    _lad = [b.strip() for b in os.environ.get("AEGIS_FALLBACK", "").split(",") if b.strip()]
-    _lad = [b for b in _lad if b.lower() not in _CHAT_LADDER_EXCLUDE]            # drop tool-incompatible legs
-    _lad = [b for b in _lad if _apply_brain(b, ds_model=_ds_model)[0] is not None]  # keep only credentialed legs
     client, model, label = _apply_brain(brain, ds_model=model)
     if client is None:
         print("[ds-operator] " + label, flush=True)
@@ -4510,11 +4868,11 @@ def run(task_text, model, thinking, max_iter, gate, remediate_on_finish=False):
     _, endpoint = _resolve_key_endpoint()
     _CTX.update(client=client, model=model, thinking=thinking, gate=gate, depth=0, sub_max_iter=8,
                 brain=_BRAIN_CANON.get(brain, brain), ds_model=_ds_model, label=label,
-                fallback=_lad, fallback_i=-1)
+                fallback=_lad, fallback_i=-1)   # fallback_i=-1: first failover advances to _lad[0]
     if _lad:
         print(f"[ds-operator] failover ladder (on error only): {label} -> {' -> '.join(_lad)}", flush=True)
     _banner(model, endpoint, gate)
-    messages = [{"role": "system", "content": SYSTEM + _DOCTRINE + _skill_preface() + _mode_policy(TARGET_MODE) + _memory_preface() + _ledger_block()}, {"role": "user", "content": task_text}]
+    messages = [{"role": "system", "content": SYSTEM + _DOCTRINE + _KILL_DISCIPLINE + _skill_preface() + _mode_policy(TARGET_MODE) + _memory_preface() + _ledger_block()}, {"role": "user", "content": task_text}]
     summ = _agent_loop(client, model, thinking, messages, list(TOOLS.keys()), max_iter, gate, depth=0, tag="[DS")
     if summ is not None:
         print("=" * 72 + "\nDS-OPERATOR FINAL:\n" + summ + "\n" + "=" * 72)
@@ -4577,9 +4935,10 @@ def run_chat(model, thinking, gate, session_path=None, resume=False):
     # (chat always STARTS on `brain`, i.e. --brain / AEGIS_BRAIN / the live /brain pick), and legs that can't
     # drive interactive chat (groq/gemini -- 413 on the full tools payload / free-quota 429) are dropped so
     # the ladder can never hijack chat onto a dead leg. Empty -> inert.
-    _lad = [b.strip() for b in os.environ.get("AEGIS_FALLBACK", "").split(",") if b.strip()]
-    _lad = [b for b in _lad if b.lower() not in _CHAT_LADDER_EXCLUDE]           # drop chat-incompatible legs
-    _lad = [b for b in _lad if _apply_brain(b, ds_model=model)[0] is not None]  # keep only credentialed legs
+    # AEGIS_FALLBACK wins; else the DS brain DEFAULTS to a ds-or leg (402 Insufficient-Balance on direct
+    # DeepSeek -> DeepSeek-over-OpenRouter). Probing legs mutates AEGIS_PROVIDER, so the real brain is
+    # (re-)applied just below. FAILOVER-ONLY: chat still STARTS on `brain`.
+    _lad = _resolve_fallback(brain, model)
     _start_i = -1   # not on any leg yet -> the FIRST failover advances to _lad[0]; chat STARTS on `brain`
     client, rmodel, label = _apply_brain(brain, ds_model=model)
     if client is None:
@@ -4760,6 +5119,14 @@ if __name__ == "__main__":
                     help="STAGE 10: after the run finishes, deterministically run the remediation round over "
                          "this run's VERIFIED findings (safety net for autonomous no-human runs). No-op if none.")
     a = ap.parse_args()
+    # Populate ALL provider creds from operator/secret.env into os.environ BEFORE any brain resolves, so
+    # keys config.Master doesn't curate (e.g. OPENROUTER_API_KEY) are present -- else the DS->DS-OR failover
+    # leg looks keyless and the ladder stays empty. Idempotent; only sets missing vars; never raises.
+    try:
+        import cf_agent as _cfa
+        _cfa.load_secret_env()
+    except Exception:
+        pass
     if a.provider:
         os.environ["AEGIS_PROVIDER"] = a.provider
         if a.provider == "openai" and "deepseek" in a.model.lower():

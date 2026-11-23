@@ -50,7 +50,7 @@ def _kali(cmd, timeout):
     env = dict(os.environ, MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*")
     argv = (["wsl", "-d", WSL, "-u", "root", "--"] if os.name == "nt" else []) + ["bash", "-lc", cmd]
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+        p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env)
         return (p.stdout or "") + "\n" + (p.stderr or "")
     except Exception as e:
         return f"[run error: {e}]"

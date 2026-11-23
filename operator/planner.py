@@ -303,7 +303,7 @@ class Planner:
         cmd += f" {json.dumps(query)}"          # quoted query
         try:
             p = subprocess.run(_shell_argv(self.distro, cmd),
-                               capture_output=True, text=True, timeout=120)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
             out = (p.stdout or "").strip()
             i = out.find("[")
             return json.loads(out[i:]) if i >= 0 else []
@@ -315,7 +315,7 @@ class Planner:
                f"--limit {int(limit)}")
         try:
             p = subprocess.run(_shell_argv(self.distro, cmd),
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
             out = (p.stdout or "").strip()
             i = out.find("{")
             return (json.loads(out[i:]).get("related_techniques", []) if i >= 0 else [])
@@ -540,7 +540,7 @@ class Planner:
         """Best-effort offline CVE-RAG query (shelled into the RAG home). Returns [] if unavailable."""
         cmd = f"cd {self.rag_home} && python3 rag_query.py --json --k {int(limit)} {json.dumps(terms)}"
         try:
-            p = subprocess.run(_shell_argv(self.distro, cmd), capture_output=True, text=True, timeout=60)
+            p = subprocess.run(_shell_argv(self.distro, cmd), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
             out = (p.stdout or "").strip(); i = out.find("[")
             return json.loads(out[i:]) if i >= 0 else []
         except Exception:
@@ -1134,7 +1134,7 @@ class Planner:
         try:
             p = subprocess.run(_shell_argv(self.distro,
                                 f"cd {self.rag_home} && python3 -c {json.dumps(py)} {json.dumps(payload)}"),
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
             return {"ok": p.returncode == 0, "out": (p.stdout or p.stderr).strip()[:200]}
         except Exception as e:
             return {"ok": False, "error": str(e)[:160]}

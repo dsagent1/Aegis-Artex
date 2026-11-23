@@ -36,7 +36,11 @@ def _kali(cmd: str, timeout: int = 600) -> str:
             argv = ["wsl", "-d", WSL_DISTRO, "-u", "root", "--", "bash", "-lc", cmd]
         else:
             argv = ["bash", "-lc", cmd]
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        # encoding+errors MUST be set: on Windows text=True defaults to cp1252 and a reader thread CRASHES
+        # (UnicodeDecodeError) on any non-cp1252 byte from a Kali tool, silently losing that tool's output
+        # and degrading hunt/Planner runs. utf-8 + errors=replace matches the co-pilot's t_run_command.
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                           encoding="utf-8", errors="replace")
         return (p.stdout or "")
     except Exception as e:
         return f"[kali error: {e}]"

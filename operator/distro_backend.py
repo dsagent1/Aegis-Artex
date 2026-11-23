@@ -55,7 +55,7 @@ def _run(argv, timeout=1800):
     env = dict(os.environ)
     if platform.system() == "Windows":
         env.update(MSYS_NO_PATHCONV="1", MSYS2_ARG_CONV_EXCL="*")
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+    r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env)
     return r.returncode, r.stdout, r.stderr
 
 
