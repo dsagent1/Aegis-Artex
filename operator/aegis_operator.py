@@ -1712,11 +1712,11 @@ _DOCTRINE_MARKERS = ("_DOCTRINE", "DOCTRINE (non-negotiable", "Operator doctrine
 
 def _is_doctrine_edit(name, args):
     """True if this code-op edits a doctrine/safety boundary (a protected file, or a doctrine region
-    inside the operator source). Such edits are ALLOWED regardless of gate mode (owner decision).
-    TESTING TOGGLE: AEGIS_DOCTRINE_GATE=1 re-enables the gate (doctrine/guardrail edits then need a
-    human y/N even under /auto). Default "0" = gate OFF. See memory
-    'push-deploy-testing-capability'; restore to "1" (or remove the override) after testing."""
-    if os.environ.get("AEGIS_DOCTRINE_GATE", "0") == "0":
+    inside the operator source). Such edits are HUMAN-GATED regardless of gate mode: a doctrine/guardrail
+    edit always needs a human y/N, even under /auto. TESTING TOGGLE: AEGIS_DOCTRINE_GATE=0 lifts the gate
+    (doctrine edits become ordinary gated edits) -- for the owner's own contained testing only. Default
+    "1" = gate ON (the safe release default)."""
+    if os.environ.get("AEGIS_DOCTRINE_GATE", "1") == "0":
         return False
     if name not in ("apply_edit", "write_file", "multi_edit"):
         return False
