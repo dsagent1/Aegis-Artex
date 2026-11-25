@@ -4846,7 +4846,11 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                 # agent never used a proven stack tool -- i.e. it freewheeled with raw run_command/scripts
                 # instead of the discovery/planner/RAG/Kali/oracle machinery. Applies in chat too (that is the
                 # whole point: standby chat otherwise has NO gates). Nudges ONCE, then honours the next finish().
-                if (_require_stack() or _standby_discipline()) and not stack_used and (not require_stack_nudged or _gates_persist()):
+                # REQUIRE-STACK is its OWN lever (/forcedstack), DECOUPLED from standby-discipline: discipline
+                # drives to EXECUTION (Hard Floor + verify/execute/record + oracle) but does NOT force the
+                # proven stack, so a disciplined run may freely pursue novel-code / custom probes. Combine with
+                # /forcedstack when you also want the canned machinery. (Persistence still follows discipline.)
+                if _require_stack() and not stack_used and (not require_stack_nudged or _gates_persist()):
                     require_stack_nudged = True
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({
                         "use_the_stack_first": True, "note": "AEGIS_REQUIRE_STACK is ON: you have NOT used the "

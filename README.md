@@ -77,6 +77,9 @@ open-source offensive tooling.
   refuses a prose-only hand-back while the objective is unmet and nothing was dispatched — forcing one
   concrete probe. Genuine scope/authorization questions stay exempt, and it is capped per turn so
   interactivity is never trapped. Default **off** (plain conversational chat); `/discipline off` to free it.
+  Discipline drives *execution*, not the stack: it is **decoupled from forced-stack**, so a disciplined
+  run may freely pursue novel-code / custom probes — add `/forcedstack` only when you also want the
+  proven machinery.
 - Runtime safety: **noise governor** (per-host pacing + 429/503 backoff), **untrusted-output nonce
   boundary**, signed **scope/authorization** gates (fail-closed).
 

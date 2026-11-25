@@ -10,10 +10,15 @@ PHASE 1 -- finish gates (a "clever" model that finishes on a self-reported kill)
        out-of-band ORACLE runs before finish() is honoured.
 
 PHASE 2 -- the Hard Floor (a model that hands back to the operator in prose, no tool call):
-  OFF: the no-action hand-back is accepted -- clever talk, zero execution (the escape
-       hatch Phase 1 leaves open).
+  OFF: the no-action hand-back is accepted -- clever talk, zero execution.
   ON : the hand-back is refused and ONE concrete probe is forced -- UNLESS the hand-back
-       is a genuine scope/authorization question, which stays exempt (interactivity intact).
+       is a genuine scope/authorization question, which stays exempt.
+
+DECOUPLING -- discipline drives EXECUTION but does NOT force the proven stack:
+  discipline ON, forced-stack OFF: a novel raw-run_command probe + a neutral finish is
+       accepted; the proven stack (content_discovery) is NEVER forced -> novel-code is free.
+  forced-stack ON (/forcedstack): the SAME novel brain IS pushed onto the stack
+       (content_discovery forced before finish) -> the stack lever still works, independently.
 
 No network, no LLM, no Kali: _create, the tools, and the oracle are stubbed.
 Run:  python operator/_standby_discipline_tests.py
@@ -29,6 +34,7 @@ import aegis_operator as ao  # noqa: E402
 
 CONFIRM_SUMMARY = ("Confirmed SQL injection on /rest/user/login -- admin auth bypass, "
                    "oracle-confirmed admin access via ' OR 1=1--")
+NEUTRAL_SUMMARY = "Probed the login surface with a custom request; no conclusive result, reporting back."
 GATE_MARKERS = ("use_the_stack_first", "verify_before_finish", "execute_before_finish",
                 "record_before_finish")
 HARDFLOOR_MARK = "STANDBY HARD FLOOR"
@@ -60,13 +66,19 @@ class FakeGate:
         return True
 
 
+def _has_call(msgs, name):
+    return any(((tcd.get("function") or {}).get("name") == name)
+               for m in msgs for tcd in (m.get("tool_calls") or []) if isinstance(tcd, dict))
+
+
 class Harness:
     """Installs stubs on the module and provides a scripted brain selected by `mode`."""
     def __init__(self, mode):
-        self.mode = mode          # "finish" | "stall" | "question"
+        self.mode = mode          # "finish" | "stall" | "question" | "novel"
         self.run_cmd_calls = 0
         self.record_calls = 0
         self.oracle_calls = 0
+        self.cd_calls = 0         # content_discovery (a proven-stack tool)
         self.brain_calls = 0
         self._saved = {}
 
@@ -75,28 +87,36 @@ class Harness:
         msgs = kw.get("messages", [])
         last = msgs[-1] if msgs else {}
         last_content = str(last.get("content", "")) if last.get("role") in ("tool", "user") else ""
-        acted = any(((tcd.get("function") or {}).get("name") in ("run_command", "record_finding"))
-                    for m in msgs for tcd in (m.get("tool_calls") or []) if isinstance(tcd, dict))
+        acted = _has_call(msgs, "run_command") or _has_call(msgs, "record_finding")
 
         if self.mode == "finish":
-            if any(k in last_content for k in GATE_MARKERS):   # a gate refused -> do the work
+            if any(k in last_content for k in GATE_MARKERS):
                 return _Resp(_Msg("Running the probe and recording first.", [
                     _tc("run_command", command="curl -s -X POST .../rest/user/login -d \"email=' OR 1=1--\""),
                     _tc("record_finding", title="SQLi auth bypass", severity="critical",
                         endpoint="/rest/user/login", status="confirmed", evidence="admin JWT returned"),
                 ]))
-            if acted:                                          # finding persisted -> finish for real
+            if acted:
                 return _Resp(_Msg("Done.", [_tc("finish", summary=CONFIRM_SUMMARY)]))
             return _Resp(_Msg("I've reasoned it out.", [_tc("finish", summary=CONFIRM_SUMMARY)]))
+
+        if self.mode == "novel":
+            # A novel/freewheeling worker: custom raw run_command probe, no canned stack.
+            if "use_the_stack_first" in last_content:   # only reachable when forced-stack pushes it
+                return _Resp(_Msg("OK -- mapping with the stack.",
+                                  [_tc("content_discovery", base_url="http://localhost:3000")]))
+            if _has_call(msgs, "run_command"):
+                return _Resp(_Msg("Reporting back.", [_tc("finish", summary=NEUTRAL_SUMMARY)]))
+            return _Resp(_Msg("Writing a custom probe.",
+                              [_tc("run_command", command="curl -s http://localhost:3000/rest/user/login -d '{}'")]))
 
         # Phase 2 hand-back brains ("stall" / "question")
         if acted:
             return _Resp(_Msg("Done -- handing back with the result.", None))
-        if HARDFLOOR_MARK in last_content:                     # Hard Floor pushed back -> act now
+        if HARDFLOOR_MARK in last_content:
             return _Resp(_Msg("Right -- firing the probe.", [
                 _tc("run_command", command="curl -s -X POST http://localhost:3000/rest/user/login "
                     "-d '{\"email\":\"'\"'\"' OR 1=1--\",\"password\":\"x\"}'")]))
-        # fresh turn -> a prose-only hand-back (no tool call)
         return _Resp(_Msg(QUESTION_PROSE if self.mode == "question" else STALL_PROSE, None))
 
     def _stub_run_command(self, **kw):
@@ -108,6 +128,10 @@ class Harness:
         self.record_calls += 1
         return json.dumps({"recorded": "finding", "status": "recorded", "title": kw.get("title", "")})
 
+    def _stub_content_discovery(self, **kw):
+        self.cd_calls += 1
+        return json.dumps({"endpoints": ["/rest/user/login"], "note": "stub"})
+
     def _stub_oracle(self, run_only=True):
         self.oracle_calls += 1
         return {"candidates": 1, "verified": 1, "rejected": 0,
@@ -115,11 +139,12 @@ class Harness:
 
     def __enter__(self):
         self._saved = {"_create": ao._create, "run": ao.TOOLS["run_command"],
-                       "rec": ao.TOOLS["record_finding"], "oracle": ao._verify_run_candidates,
-                       "_CTX": dict(ao._CTX), "_VF": ao._VF}
+                       "rec": ao.TOOLS["record_finding"], "cd": ao.TOOLS["content_discovery"],
+                       "oracle": ao._verify_run_candidates, "_CTX": dict(ao._CTX), "_VF": ao._VF}
         ao._create = self.brain
         ao.TOOLS["run_command"] = (lambda **kw: self._stub_run_command(**kw), False, ao.TOOLS["run_command"][2])
         ao.TOOLS["record_finding"] = (lambda **kw: self._stub_record_finding(**kw), False, ao.TOOLS["record_finding"][2])
+        ao.TOOLS["content_discovery"] = (lambda **kw: self._stub_content_discovery(**kw), True, ao.TOOLS["content_discovery"][2])
         ao._verify_run_candidates = self._stub_oracle
         ao._VF = object()
         ao._CTX.clear(); ao._CTX.update(brain="ds", thinking=False, depth=0)
@@ -129,14 +154,15 @@ class Harness:
         ao._create = self._saved["_create"]
         ao.TOOLS["run_command"] = self._saved["run"]
         ao.TOOLS["record_finding"] = self._saved["rec"]
+        ao.TOOLS["content_discovery"] = self._saved["cd"]
         ao._verify_run_candidates = self._saved["oracle"]
         ao._VF = self._saved["_VF"]
         ao._CTX.clear(); ao._CTX.update(self._saved["_CTX"])
 
 
-def _run(mode, discipline):
-    os.environ.pop("AEGIS_REQUIRE_STACK", None)
+def _run(mode, discipline, forced_stack=False):
     os.environ.pop("AEGIS_STANDBY_HARDFLOOR", None)
+    os.environ["AEGIS_REQUIRE_STACK"] = "1" if forced_stack else "0"
     if discipline:
         os.environ["AEGIS_STANDBY_DISCIPLINE"] = "1"
     else:
@@ -145,7 +171,7 @@ def _run(mode, discipline):
         messages = [{"role": "system", "content": "sys"},
                     {"role": "user", "content": "find and verify an auth bypass on the mirror"}]
         summ = ao._agent_loop(None, "deepseek-flash", False, messages,
-                              ["finish", "record_finding", "run_command"],
+                              ["finish", "record_finding", "run_command", "content_discovery"],
                               8, FakeGate(), depth=0, tag="[TST", chat=True, quiet=True)
     return summ, h
 
@@ -156,7 +182,6 @@ def main():
     print("=" * 72)
     fails = []
 
-    # ---------- PHASE 1: finish gates ----------
     print("\n--- PHASE 1: finish gates (clever self-reported kill) ---")
     s_off, off = _run("finish", False)
     orc_off = "ORACLE VERIFICATION" in (s_off or "")
@@ -172,25 +197,35 @@ def main():
     if not (on.run_cmd_calls >= 1 and on.record_calls >= 1 and on.oracle_calls >= 1 and orc_on):
         fails.append("P1 ON: expected forced probe + recorded finding + oracle at finish")
 
-    # ---------- PHASE 2: the Hard Floor on a prose-only hand-back ----------
     print("\n--- PHASE 2: Hard Floor (prose-only hand-back, no tool call) ---")
     s_off2, off2 = _run("stall", False)
-    print(f"[OFF] brain_calls={off2.brain_calls} run_command={off2.run_cmd_calls} "
-          f"handed_back={s_off2 is None}")
+    print(f"[OFF] brain_calls={off2.brain_calls} run_command={off2.run_cmd_calls} handed_back={s_off2 is None}")
     if not (off2.run_cmd_calls == 0 and off2.brain_calls == 1 and s_off2 is None):
         fails.append("P2 OFF: expected the no-action hand-back to be accepted (zero execution)")
     s_on2, on2 = _run("stall", True)
-    print(f"[ON ] brain_calls={on2.brain_calls} run_command={on2.run_cmd_calls} "
-          f"handed_back={s_on2 is None}  (hard floor forced a probe)")
+    print(f"[ON ] brain_calls={on2.brain_calls} run_command={on2.run_cmd_calls} handed_back={s_on2 is None}")
     if not (on2.run_cmd_calls >= 1 and on2.brain_calls >= 2):
         fails.append("P2 ON: expected the Hard Floor to refuse the hand-back and force a probe")
 
-    # ---------- PHASE 2: question exemption (do NOT trap interactivity) ----------
     print("\n--- PHASE 2: scope/authorization question is EXEMPT (ON) ---")
     s_q, q = _run("question", True)
     print(f"[ON ] brain_calls={q.brain_calls} run_command={q.run_cmd_calls} handed_back={s_q is None}")
     if not (q.run_cmd_calls == 0 and q.brain_calls == 1 and s_q is None):
         fails.append("P2 EXEMPT: a genuine scope/auth question must be allowed to hand back")
+
+    print("\n--- DECOUPLING: discipline drives execution but does NOT force the stack ---")
+    # discipline ON, forced-stack OFF: novel raw probe + neutral finish accepted; stack NOT forced.
+    s_nv, nv = _run("novel", True, forced_stack=False)
+    print(f"[disc ON, forced OFF] run_command={nv.run_cmd_calls} content_discovery={nv.cd_calls} "
+          f"finish_accepted={s_nv is not None}  (novel probe, stack NOT forced)")
+    if not (nv.run_cmd_calls >= 1 and nv.cd_calls == 0 and s_nv is not None):
+        fails.append("DECOUPLE: disciplined novel run must execute + finish WITHOUT being forced onto the stack")
+    # forced-stack ON: the SAME novel brain IS pushed onto the proven stack before finish.
+    s_fs, fs = _run("novel", True, forced_stack=True)
+    print(f"[disc ON, forced ON ] run_command={fs.run_cmd_calls} content_discovery={fs.cd_calls} "
+          f"finish_accepted={s_fs is not None}  (/forcedstack still forces the stack)")
+    if not (fs.cd_calls >= 1 and s_fs is not None):
+        fails.append("DECOUPLE: /forcedstack must still force a proven-stack tool before finish")
 
     print("\n" + "-" * 72)
     if fails:
@@ -199,10 +234,12 @@ def main():
             print("  - " + f)
         sys.exit(1)
     print("RESULT: PASS")
-    print("  P1: flag flips a clever finish() from accepted-with-zero-execution to")
-    print("      refused-until-probe+recorded-finding+oracle.")
-    print("  P2: flag flips a prose-only hand-back from accepted-with-zero-execution to")
-    print("      refused-and-one-probe-forced; a genuine scope/auth question stays exempt.")
+    print("  P1: flag flips a clever finish() from accepted-with-zero-execution to refused-until-"
+          "probe+recorded-finding+oracle.")
+    print("  P2: flag flips a prose-only hand-back from accepted to refused-and-one-probe-forced; a")
+    print("      genuine scope/auth question stays exempt.")
+    print("  DECOUPLE: discipline drives execution without forcing the stack (novel-code free); "
+          "/forcedstack remains the separate stack lever.")
     sys.exit(0)
 
 
