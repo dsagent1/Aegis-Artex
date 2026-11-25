@@ -1221,6 +1221,39 @@ def _handle_control(line, gate):
                             "STANDBY-DISCIPLINE OFF -- free conversational chat (legacy; gates + Hard Floor off). "
                             "/discipline on to drive execution.")
         return "handled"
+    if low == "/hunt" or low.startswith("/hunt "):
+        # Dispatch the autonomous FRONTIER directly (skips the model's decision): the `hunt` tool runs
+        # agent_hunt_live (novelty-brain -> N oracle-verifying workers) and returns oracle-VERIFIED findings.
+        # Usage: /hunt <objective> [--budget N] [--agents N]. Blocks (with a status) until it finishes or the
+        # AEGIS_HUNT_TIMEOUT cap; non-destructive. Structure the objective as a RESULT across a SURFACE/ROLES
+        # (e.g. "find and verify auth/access-control vulns across the mirror and all roles"), not a single
+        # payload -- the frontier plans the angles. For one targeted probe, use run_tool/run_command instead.
+        rest = (line or "").strip()[len("/hunt"):].strip()
+        if not rest:
+            _emit("HUNT", "usage: /hunt <objective> [--budget N] [--agents N] -- runs the frontier (oracle-verified). "
+                          "Objective = a RESULT across a surface/roles, e.g. 'find+verify access-control vulns across the mirror'.")
+            return "handled"
+        budget, agents = 16, 2
+        _mb = re.search(r"--budget\s+(\d+)", rest); budget = int(_mb.group(1)) if _mb else budget
+        _ma = re.search(r"--agents\s+(\d+)", rest); agents = int(_ma.group(1)) if _ma else agents
+        obj = re.sub(r"--(?:budget|agents)\s+\d+", "", rest).strip()
+        _tmo = int(os.environ.get("AEGIS_HUNT_TIMEOUT", "600"))
+        _emit("HUNT", f"dispatching frontier hunt (budget={budget}, agents={agents}, <={_tmo}s): {obj[:90]}")
+        try:
+            with _Status(f"frontier hunt (budget={budget}, up to {_tmo}s)", timeout=_tmo + 60):
+                _res = t_hunt(obj, role="owner", budget=budget, agents=agents)
+            _rj = json.loads(_res)
+            _vf = _rj.get("verified", []) or []
+            print(f"\n[hunt] {_rj.get('verified_count', 0)} oracle-VERIFIED finding(s)"
+                  + (" (timed out; partial)" if _rj.get("timed_out") else "") + ":", flush=True)
+            for _f in _vf:
+                print(f"  - [{str(_f.get('severity') or '?').upper():8}] {_f.get('class') or ''} :: "
+                      f"{str(_f.get('summary') or '')[:110]}", flush=True)
+            if not _vf:
+                print("  (none verified this run; store: " + str(_rj.get("store", "")) + ")", flush=True)
+        except Exception as _e:
+            _emit("HUNT", f"hunt failed: {repr(_e)[:140]}")
+        return "handled"
     if low in ("/claude", "/cli"):     # Claude via the local `claude` CLI (claude -p; no thinking toggle)
         _switch_brain("claude"); return "handled"
     if low in ("/brain", "/b"):        # cycle the drivers (keeps the current thinking mode)
@@ -5185,6 +5218,9 @@ def run_chat(model, thinking, gate, session_path=None, resume=False):
     print("Discipline: /discipline on|off (ARTEX-style: finish-gates + Hard Floor + finish-oracle in chat; "
           "on=hunt, off=plain chat)  |  discipline="
           + ("on" if os.environ.get("AEGIS_STANDBY_DISCIPLINE") == "1" else "off"), flush=True)
+    print("Hunt: /hunt <objective> [--budget N] [--agents N] -- dispatch the autonomous FRONTIER directly "
+          "(breadth + per-attempt oracle; returns oracle-verified findings). Objective = a RESULT across a "
+          "surface/roles, not one payload.", flush=True)
     print("Also: /status (what am I doing) · /stop or Ctrl+C (abort the CURRENT task only -- the session "
           "stays open; breaks a streaming reply immediately, a running tool at its next safe point)", flush=True)
     print("Review: /summary (brief of this chat) · /search <text> (find it across the chat) · /scroll <ms> "

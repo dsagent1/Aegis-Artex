@@ -84,7 +84,11 @@ open-source offensive tooling.
   the chat co-pilot delegates to the budgeted autonomous **frontier** (one novelty-brain fans distinct
   `(angle, surface, vuln-class, mechanism)` intents to N concurrent workers, each **oracle-verified**)
   rather than hand-rolling probes — breadth **and** verification in one call, returning only ground-truth
-  findings. Use direct probes for a single targeted check.
+  findings. Use direct probes for a single targeted check. Dispatch it directly in chat with
+  **`/hunt <objective> [--budget N] [--agents N]`** (or just ask broadly and the co-pilot calls it).
+  Structure the objective as a **result across a surface/roles**, not one payload — e.g.
+  `find and verify access-control vulnerabilities across the mirror and its roles` — because the frontier
+  plans its own angles; for one specific check use a direct `run_tool`/`run_command` probe instead.
 - Runtime safety: **noise governor** (per-host pacing + 429/503 backoff), **untrusted-output nonce
   boundary**, signed **scope/authorization** gates (fail-closed).
 
