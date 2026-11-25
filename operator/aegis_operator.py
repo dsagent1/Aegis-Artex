@@ -1221,6 +1221,18 @@ def _handle_control(line, gate):
                             "STANDBY-DISCIPLINE OFF -- free conversational chat (legacy; gates + Hard Floor off). "
                             "/discipline on to drive execution.")
         return "handled"
+    if low == "/target" or low.startswith("/target "):
+        # Set/show the live hunt+oracle target (AEGIS_TARGET) WITHOUT relaunching. /hunt, prose hunts and
+        # the oracle replay all read it. Bare /target shows the current value. Authorized targets only.
+        rest = (line or "").strip()[len("/target"):].strip()
+        if not rest:
+            _emit("TARGET", "current AEGIS_TARGET = " + (os.environ.get("AEGIS_TARGET") or "(unset)")
+                  + "  -- set with:  /target <url>  (authorized targets only)")
+            return "handled"
+        os.environ["AEGIS_TARGET"] = rest; os.environ["AEGIS_TARGET_BASE"] = rest
+        _emit("TARGET", f"AEGIS_TARGET set to {rest} -- used by /hunt, prose hunts and the oracle replay. "
+                        "Must be a target you own or are authorized to test.")
+        return "handled"
     if low == "/hunt" or low.startswith("/hunt "):
         # Dispatch the autonomous FRONTIER directly (skips the model's decision): the `hunt` tool runs
         # agent_hunt_live (novelty-brain -> N oracle-verifying workers) and returns oracle-VERIFIED findings.
@@ -1230,13 +1242,18 @@ def _handle_control(line, gate):
         # payload -- the frontier plans the angles. For one targeted probe, use run_tool/run_command instead.
         rest = (line or "").strip()[len("/hunt"):].strip()
         if not rest:
-            _emit("HUNT", "usage: /hunt <objective> [--budget N] [--agents N] -- runs the frontier (oracle-verified). "
-                          "Objective = a RESULT across a surface/roles, e.g. 'find+verify access-control vulns across the mirror'.")
+            _emit("HUNT", "usage: /hunt <objective> [--target URL] [--budget N] [--agents N] -- runs the frontier "
+                          "(oracle-verified). Objective = a RESULT across a surface/roles; --target sets AEGIS_TARGET "
+                          "for this and later hunts (authorized targets only).")
             return "handled"
         budget, agents = 16, 2
         _mb = re.search(r"--budget\s+(\d+)", rest); budget = int(_mb.group(1)) if _mb else budget
         _ma = re.search(r"--agents\s+(\d+)", rest); agents = int(_ma.group(1)) if _ma else agents
-        obj = re.sub(r"--(?:budget|agents)\s+\d+", "", rest).strip()
+        _mtg = re.search(r"--target\s+(\S+)", rest)
+        if _mtg:                                   # set the live target for this + later hunts (and the oracle)
+            os.environ["AEGIS_TARGET"] = _mtg.group(1); os.environ["AEGIS_TARGET_BASE"] = _mtg.group(1)
+            _emit("TARGET", f"AEGIS_TARGET set to {_mtg.group(1)}")
+        obj = re.sub(r"--(?:budget|agents)\s+\d+|--target\s+\S+", "", rest).strip()
         _tmo = int(os.environ.get("AEGIS_HUNT_TIMEOUT", "600"))
         _emit("HUNT", f"dispatching frontier hunt (budget={budget}, agents={agents}, <={_tmo}s): {obj[:90]}")
         try:
@@ -5286,9 +5303,12 @@ def run_chat(model, thinking, gate, session_path=None, resume=False):
     print("Discipline: /discipline on|off (ARTEX-style: finish-gates + Hard Floor + finish-oracle in chat; "
           "on=hunt, off=plain chat)  |  discipline="
           + ("on" if os.environ.get("AEGIS_STANDBY_DISCIPLINE") == "1" else "off"), flush=True)
-    print("Hunt: /hunt <objective> [--budget N] [--agents N] -- dispatch the autonomous FRONTIER directly "
-          "(breadth + per-attempt oracle; returns oracle-verified findings). Objective = a RESULT across a "
-          "surface/roles, not one payload.", flush=True)
+    print("Hunt: /hunt <objective> [--target URL] [--budget N] [--agents N] -- dispatch the autonomous "
+          "FRONTIER directly (breadth + per-attempt oracle; returns oracle-verified findings). Objective = a "
+          "RESULT across a surface/roles, not one payload.", flush=True)
+    print("Target: /target <url> -- set the live hunt/oracle target (AEGIS_TARGET) without relaunching; bare "
+          "/target shows it. Current=" + (os.environ.get("AEGIS_TARGET") or "(unset)")
+          + "  (authorized targets only).", flush=True)
     print("Also: /status (what am I doing) · /stop or Ctrl+C (abort the CURRENT task only -- the session "
           "stays open; breaks a streaming reply immediately, a running tool at its next safe point)", flush=True)
     print("Review: /summary (brief of this chat) · /search <text> (find it across the chat) · /scroll <ms> "
