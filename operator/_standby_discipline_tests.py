@@ -110,6 +110,16 @@ class Harness:
             return _Resp(_Msg("Writing a custom probe.",
                               [_tc("run_command", command="curl -s http://localhost:3000/rest/user/login -d '{}'")]))
 
+        if self.mode == "probe_handback":
+            # probed + recorded a candidate, then hands back in PROSE (no finish, no verify_findings)
+            if acted:
+                return _Resp(_Msg("I probed and recorded a candidate SQLi; here's my read. Handing back.", None))
+            return _Resp(_Msg("Probing and recording a candidate.", [
+                _tc("run_command", command="curl -s -X POST http://localhost:3000/rest/user/login -d '{}'"),
+                _tc("record_finding", title="candidate SQLi on login", severity="high",
+                    endpoint="/rest/user/login", status="confirmed", evidence="possible bypass"),
+            ]))
+
         # Phase 2 hand-back brains ("stall" / "question")
         if acted:
             return _Resp(_Msg("Done -- handing back with the result.", None))
@@ -226,6 +236,20 @@ def main():
           f"finish_accepted={s_fs is not None}  (/forcedstack still forces the stack)")
     if not (fs.cd_calls >= 1 and s_fs is not None):
         fails.append("DECOUPLE: /forcedstack must still force a proven-stack tool before finish")
+
+    print("\n--- PROSE-HANDBACK ORACLE: unverified candidates get adjudicated on a prose hand-back ---")
+    # discipline OFF: probe+record then prose hand-back -> oracle NEVER runs (the gap).
+    s_po, po = _run("probe_handback", False)
+    print(f"[OFF] run_command={po.run_cmd_calls} record={po.record_calls} oracle={po.oracle_calls} "
+          f"handed_back={s_po is None}")
+    if not (po.run_cmd_calls >= 1 and po.record_calls >= 1 and po.oracle_calls == 0 and s_po is None):
+        fails.append("PROSE-HANDBACK OFF: expected NO oracle on the prose hand-back (the pre-fix gap)")
+    # discipline ON: the same prose hand-back auto-runs the oracle on the unverified candidate.
+    s_pn, pn = _run("probe_handback", True)
+    print(f"[ON ] run_command={pn.run_cmd_calls} record={pn.record_calls} oracle={pn.oracle_calls} "
+          f"handed_back={s_pn is None}  (oracle auto-ran on hand-back)")
+    if not (pn.run_cmd_calls >= 1 and pn.record_calls >= 1 and pn.oracle_calls >= 1 and s_pn is None):
+        fails.append("PROSE-HANDBACK ON: expected the oracle to auto-run on the prose hand-back")
 
     print("\n" + "-" * 72)
     if fails:

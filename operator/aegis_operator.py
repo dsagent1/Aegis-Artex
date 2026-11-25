@@ -4379,6 +4379,7 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
     acted_this_turn = False           # HARD FLOOR: any real dispatch (probe / stack tool / recorded finding) this turn
     hardfloor_fires = 0               # HARD FLOOR: no-action hand-backs refused this turn (capped)
     _HARDFLOOR_MAX = int(os.environ.get("AEGIS_STANDBY_HARDFLOOR_MAX", "3"))
+    verified_this_turn = False        # HARD FLOOR: candidates were adjudicated this turn (verify_findings or finish-oracle)
     board_rescues = 0                 # BOARD-RESCUE circuit-breaker: times the board was pulled on a strategic stall
     _BOARD_MAX_RESCUES = 2            # cap board interventions so it stays an ADVISOR, never a crutch or a gate
     _BOARD_STALL_WINDOW = 7           # interaction-turns with NO new ledger progress that count as "stalled"
@@ -4723,6 +4724,29 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                         "(an oracle-verified finding) or truly exhausted. Do not reply in prose again without acting."})
                     _p(f"{tag} [hard-floor] refused a no-action hand-back -- forcing a concrete step (#{hardfloor_fires})\n", flush=True)
                     continue
+                # PROSE-HANDBACK ORACLE (Phase 2 fix): the model probed + recorded candidate(s) this turn but is
+                # handing back in prose WITHOUT finish() -- so the finish-oracle never ran and the candidates sit
+                # UNVERIFIED. Don't let unverified claims leave on a hand-back: run the out-of-band oracle now so
+                # only ground truth stands (doctrine: only oracle-verified counts). Deterministic, not model-driven.
+                if (depth == 0 and _standby_discipline() and finding_recorded and not verified_this_turn
+                        and _VF is not None):
+                    verified_this_turn = True
+                    try:
+                        _vr = _verify_run_candidates(run_only=True)
+                        if _vr.get("candidates"):
+                            _p(f"{tag} [oracle] hand-back verification: {_vr.get('verified',0)} verified, "
+                               f"{_vr.get('rejected',0)} rejected, of {_vr['candidates']} recorded candidate(s)\n", flush=True)
+                            _vlines = "\n".join(f"  - [{r.get('verdict','?').upper()}] {r.get('claim','')}"
+                                                for r in _vr.get("results", []))
+                            messages.append({"role": "user", "content":
+                                "[ORACLE -- ground truth, out-of-band] You handed back with candidate findings that "
+                                "were not yet verified; the oracle re-fired their proof requests:\n"
+                                f"{_vr.get('verified',0)} VERIFIED / {_vr.get('rejected',0)} REJECTED of "
+                                f"{_vr['candidates']} candidate(s):\n" + _vlines +
+                                "\nTreat only the VERIFIED ones as confirmed; a REJECTED candidate is NOT a finding "
+                                "(do not report it as confirmed)."})
+                    except Exception as _e:
+                        _p(f"{tag} [oracle] hand-back verify skipped: {repr(_e)[:80]}\n", flush=True)
                 return None  # genuine hand-back: a question, no open plan, or auto-continue budget spent
             messages.append({"role": "user", "content": "Continue: take the next action, or call finish()."})
             continue
@@ -4742,6 +4766,8 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
             if name in _STACK_TOOLS:                            # REQUIRE-STACK: a proven stack tool was used
                 stack_used = True
                 acted_this_turn = True                          # HARD FLOOR: a stack tool is a real dispatch
+            if name == "verify_findings":                       # HARD FLOOR: the model adjudicated its candidates
+                verified_this_turn = True
             if name in ("record_finding", "chain_state"):      # record-as-you-go tracking
                 turns_since_record = 0
                 interacted_since_record = False
@@ -4960,6 +4986,7 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                 # counts). depth==0 only (sub-agents don't own the ledger); best-effort, never blocks the finish.
                 if depth == 0 and (not chat or _standby_discipline()) and _VF is not None:
                     try:
+                        verified_this_turn = True
                         _vr = _verify_run_candidates(run_only=True)
                         if _vr.get("candidates"):
                             _lines = [f"  - [{r.get('verdict','?').upper()}] {r.get('claim','')}"
