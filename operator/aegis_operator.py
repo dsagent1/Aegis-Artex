@@ -4102,7 +4102,7 @@ EXECUTION DISCIPLINE (you are scored on VERIFIED kills, not on recon):
 - Never end a step with "next I would..." / "the next step is...". If you can name the next action, DO it this step.
 - Budget law: once you are past HALF your iterations without a verified kill, STOP exploring. Pick the single highest-value confirmed lead and spend every remaining step driving it to a verified result with direct requests.
 - NO exhaustive scanners in a budget-limited run: never launch a full feroxbuster/gobuster/dirb wordlist, a full-port nmap, or a full nuclei sweep -- ONE such tool eats your entire budget. Use TARGETED probes: curl a handful of likely paths, hit the known endpoint with the specific payload. If you must run a tool, cap it hard (small wordlist, --timeout, -t low) so it returns in well under a minute.
-- CONTENT DISCOVERY on a near-empty surface: if the root and your guessed paths return only a stub/placeholder with no links, the real endpoints are UNLINKED -- do NOT conclude "hardened" from extensionless guesses (/admin, /login) alone. Call the content_discovery(base_url) TOOL -- it probes the whole curated high-value endpoint list in ONE parallel pass and returns the non-404s. Do NOT hand-roll dozens of one-at-a-time curls (that burns your whole budget on discovery); do NOT loop via run_command (that is the Windows shell). Any non-404 (200/401/403/500) is a REAL endpoint.
+- CONTENT DISCOVERY on a near-empty surface (NOTE: for a BROAD hunt objective -- "find/verify vulns across the surface/roles", "hunt the mirror" -- call the `hunt` tool FIRST instead; content_discovery is a first move only for a SINGLE targeted surface, not a broad hunt): if the root and your guessed paths return only a stub/placeholder with no links, the real endpoints are UNLINKED -- do NOT conclude "hardened" from extensionless guesses (/admin, /login) alone. Call the content_discovery(base_url) TOOL -- it probes the whole curated high-value endpoint list in ONE parallel pass and returns the non-404s. Do NOT hand-roll dozens of one-at-a-time curls (that burns your whole budget on discovery); do NOT loop via run_command (that is the Windows shell). Any non-404 (200/401/403/500) is a REAL endpoint.
 - STAY ON THE CROWN JEWEL: the instant content_discovery surfaces a high-value endpoint (admin.php, login.php, api, a 401/403), LOCK ONTO IT and drive the bypass to a verdict before probing anything else -- a 401/403 is an auth/authorization control to BYPASS (missing/forgeable header, cookie, token, or param; type-juggling on the check; default/weak creds). Run through the bypass techniques back-to-back on that one endpoint. Do NOT wander back to discovering more endpoints until you have genuinely exhausted the bypasses on the crown jewel. Finding admin.php behind a 401 and walking away is NOT exhausting the surface.
 - Known-CVE probes are only the FIRST pass. A custom web app that shrugs off version/CVE payloads is NOT an exhausted surface -- the app's OWN logic is the real target. Before you treat a web target as exhausted you MUST have exercised the application itself: its AUTH/login flow (auth-bypass, type-juggling/array-injection on the REAL login fields, default/weak creds), SESSION + ACCESS CONTROL (IDOR on real object ids, forced-browse to privileged routes, missing authz), and INJECTION (SQLi/command/SSTI) in the app's REAL parameters and forms -- not canned CVE payloads against generic paths. "No public CVE fired" is a recon result, never a verdict.
 - finish() is valid ONLY after (a) a verified kill, or (b) a GENUINELY exhausted surface: you have ATTEMPTED the exploit on EVERY confirmed lead AND, for a web app, actually tested its own auth / access-control / injection logic (above) -- not merely run the known-CVE list. Do NOT finish() from recon, or from a known-CVE sweep, with the app's own logic untested.
@@ -5155,12 +5155,15 @@ If neither is true, you are not finished: issue the next tool call instead of re
 brief one-line heading before a tool call is fine, but it must be in the SAME turn as that tool
 call -- never a standalone message.
 
-DELEGATE BREADTH TO THE FRONTIER: when the objective is broad ("find/verify vulnerabilities across the
-surface / all roles", "what's exploitable here") rather than one specific probe, prefer the `hunt` tool.
-It drives the budgeted autonomous frontier (many distinct angles fanned to concurrent workers, each
-oracle-verified) and returns only ground-truth findings -- breadth AND verification in one call, far
-better than hand-rolling probes one at a time. Then babysit/report its verified findings. Use direct
-run_tool / run_command probes for a single targeted check."""
+DELEGATE BREADTH TO THE FRONTIER (overrides the "content_discovery is the first move" guidance for broad
+objectives): when the objective is broad -- "find/verify vulnerabilities across the surface / all roles",
+"what's exploitable here", or the operator says "hunt" / "run a hunt" / "sweep the mirror" -- your FIRST
+move MUST be the `hunt` tool, BEFORE content_discovery, fingerprinting or any manual curl/run_command.
+Do NOT hand-roll recon on a broad objective: call `hunt` on turn one. It drives the budgeted autonomous
+frontier (many distinct angles fanned to concurrent oracle-verifying workers) and returns only ground-truth
+findings -- breadth AND verification in one call, far better and cheaper than probing one at a time. Then
+babysit/report its verified findings. content_discovery / direct run_tool / run_command are ONLY for a
+SINGLE targeted check against one named surface -- never as the opening move of a broad hunt."""
 
 def run_chat(model, thinking, gate, session_path=None, resume=False):
     brain = _CTX.get("brain") or os.environ.get("AEGIS_BRAIN", "ds")
