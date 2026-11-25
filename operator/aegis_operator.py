@@ -731,7 +731,7 @@ def _start_reader():
     _READER_THREAD = threading.Thread(target=_run, daemon=True); _READER_THREAD.start()
     return _STDIN_Q
 
-_BLOCKING_TOOLS = {"run_command", "run_in_kali", "run_tool", "run_wrapped_tool"}   # long, blocking; run these off the main thread
+_BLOCKING_TOOLS = {"run_command", "run_in_kali", "run_tool", "run_wrapped_tool", "hunt"}   # long, blocking; run these off the main thread
 
 
 def _short(s, n=64):
@@ -1589,6 +1589,44 @@ def t_resume(task_id, note=""):
     cmd = [sys.executable, CLI, "resume", task_id] + (["--note", note] if note else [])
     p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
     return json.dumps({"stdout": p.stdout[-1500:], "stderr": p.stderr[-600:], "rc": p.returncode})
+
+def t_hunt(objective, role="owner", budget=16, agents=2):
+    """Delegate a BROAD hunting objective to the budgeted autonomous FRONTIER (agent_hunt_live):
+    ONE central novelty-brain hands each worker a distinct (angle, surface, vuln-class, mechanism)
+    fingerprint; N workers execute + ORACLE concurrently; the hash-chained ledger counts ONLY
+    oracle-VERIFIED findings (ground truth). This is the breadth-AND-verification engine -- prefer it
+    for 'find/verify vulnerabilities across the surface/roles' objectives; use direct probes/run_tool
+    for one specific check. Non-destructive; bounded by budget (information-gaining attempts) + a
+    wall-clock cap (AEGIS_HUNT_TIMEOUT, default 600s). Returns the oracle-verified findings."""
+    store = os.path.join(HERE, f"hunt_{int(time.time())}.jsonl")
+    script = os.path.join(HERE, "agent_hunt_live.py")
+    cmd = [sys.executable, script, "--objective", str(objective), "--role", str(role),
+           "--budget", str(int(budget)), "--agents", str(int(agents)), "--store", store]
+    tmo = int(os.environ.get("AEGIS_HUNT_TIMEOUT", "600"))
+    stdout = stderr = ""; rc = None; timed_out = False
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=tmo)
+        stdout, stderr, rc = p.stdout or "", p.stderr or "", p.returncode
+    except subprocess.TimeoutExpired as e:
+        timed_out = True
+        stdout = (e.stdout or b"").decode("utf-8", "replace") if isinstance(e.stdout, (bytes, bytearray)) else (e.stdout or "")
+    # ground truth: read the hash-chained ledger (the scheduler's stdout tally is not authoritative).
+    verified = []
+    try:
+        from verified_findings import FindingStore
+        for f in (FindingStore(store).verified() or []):
+            d = f if isinstance(f, dict) else getattr(f, "__dict__", {})
+            verified.append({"class": d.get("claim_type") or d.get("vuln_class"),
+                             "severity": d.get("severity"),
+                             "summary": d.get("summary") or d.get("title") or d.get("claim")})
+    except Exception:
+        m = re.search(r"verified findings \(ledger\):\s*(\d+)", stdout)
+        if m:
+            verified = [{"title": "(see ledger)"}] * int(m.group(1))
+    return json.dumps({"engine": "agent_hunt_live(frontier)", "objective": objective,
+                       "verified_count": len(verified), "verified": verified[:20], "store": store,
+                       "timed_out": timed_out, "rc": rc, "tail": (stdout[-1200:] + ("\n[stderr] " + stderr[-300:] if stderr else ""))})
 
 def t_vpn_ctl(action, region=None):
     # No region/country is baked in. The VPN is an OPTIONAL lab convenience for the tester's OWN egress
@@ -3480,6 +3518,15 @@ TOOLS = {
     "bounded=true for the tight-caps A/B. Returns the objective status + the sub-task graph.",
     {"objective": {"type": "string"}, "verification": {"type": "string"},
      "bounded": {"type": "boolean"}, "exec_max_iter": {"type": "integer"}}, ["objective"])),
+ "hunt": (t_hunt, False, _spec("hunt",
+    "Delegate a BROAD hunting objective to the budgeted autonomous FRONTIER (breadth + novelty + "
+    "per-attempt ORACLE): one novelty-brain fans distinct (angle,surface,vuln-class,mechanism) intents "
+    "to N concurrent workers that execute + oracle-verify; the hash-chained ledger counts ONLY "
+    "oracle-VERIFIED findings. This drives breadth AND verification -- prefer it for 'find/verify "
+    "vulnerabilities across the surface/roles' objectives; use direct probes/run_tool for one specific "
+    "check. Non-destructive; bounded by budget + wall-clock. Returns the oracle-verified findings.",
+    {"objective": {"type": "string"}, "role": {"type": "string"},
+     "budget": {"type": "integer"}, "agents": {"type": "integer"}}, ["objective"])),
  "content_discovery": (t_content_discovery, True, _spec("content_discovery",
     "ONE-SHOT curated content discovery: probes a fixed ~55-entry high-value endpoint list (admin.php, "
     "login.php, config.php, api.php, front controllers, sensitive files) in PARALLEL via Kali and returns "
@@ -4048,7 +4095,7 @@ _LOOP_GUARD_TOOLS = {"run_command", "run_background", "apply_edit", "write_file"
 # least one of these before finish() -- AND keeps the verify/execute/record finish-gates armed even in chat.
 _STACK_TOOLS = {"content_discovery", "fingerprint_target", "plan_and_execute", "record_finding",
                 "verify_findings", "rag_search", "exploit_search", "run_tool", "run_in_kali",
-                "submit_aegis_task", "resume_task", "provision_twin", "crack_hashes"}
+                "submit_aegis_task", "resume_task", "provision_twin", "crack_hashes", "hunt"}
 def _require_stack():
     """True when AEGIS_REQUIRE_STACK=1: enforce stack usage + keep finish-gates on in chat (testing lever)."""
     return os.environ.get("AEGIS_REQUIRE_STACK", "0") == "1"
@@ -5046,7 +5093,14 @@ Emit a plain-text (no-tool-call) message ONLY when exactly one of these is true:
       just describe completion in prose.
 If neither is true, you are not finished: issue the next tool call instead of replying in text. A
 brief one-line heading before a tool call is fine, but it must be in the SAME turn as that tool
-call -- never a standalone message."""
+call -- never a standalone message.
+
+DELEGATE BREADTH TO THE FRONTIER: when the objective is broad ("find/verify vulnerabilities across the
+surface / all roles", "what's exploitable here") rather than one specific probe, prefer the `hunt` tool.
+It drives the budgeted autonomous frontier (many distinct angles fanned to concurrent workers, each
+oracle-verified) and returns only ground-truth findings -- breadth AND verification in one call, far
+better than hand-rolling probes one at a time. Then babysit/report its verified findings. Use direct
+run_tool / run_command probes for a single targeted check."""
 
 def run_chat(model, thinking, gate, session_path=None, resume=False):
     brain = _CTX.get("brain") or os.environ.get("AEGIS_BRAIN", "ds")

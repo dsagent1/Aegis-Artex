@@ -80,6 +80,11 @@ open-source offensive tooling.
   Discipline drives *execution*, not the stack: it is **decoupled from forced-stack**, so a disciplined
   run may freely pursue novel-code / custom probes — add `/forcedstack` only when you also want the
   proven machinery.
+- **Frontier delegation (`hunt`)** — for a *broad* objective ("find/verify vulns across the surface/roles"),
+  the chat co-pilot delegates to the budgeted autonomous **frontier** (one novelty-brain fans distinct
+  `(angle, surface, vuln-class, mechanism)` intents to N concurrent workers, each **oracle-verified**)
+  rather than hand-rolling probes — breadth **and** verification in one call, returning only ground-truth
+  findings. Use direct probes for a single targeted check.
 - Runtime safety: **noise governor** (per-host pacing + 429/503 backoff), **untrusted-output nonce
   boundary**, signed **scope/authorization** gates (fail-closed).
 
