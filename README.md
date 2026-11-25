@@ -70,6 +70,13 @@ open-source offensive tooling.
   `AEGIS_REQUIRE_STACK=1` (or `/forcedstack` live, `-RequireStack` on standby) to **refuse `finish()` until
   a proven stack tool** (discovery / planner / RAG / Kali / oracle) has actually run, and keep the
   verify/execute/record finish-gates armed in chat. `/freestack` returns to the free loop.
+- **Standby discipline (optional)** — for interactive `--chat`, set `AEGIS_STANDBY_DISCIPLINE=1`
+  (or `/discipline on` live, `-Discipline` on standby) to drive the co-pilot to *execution* instead of
+  clever talk: the finish-gates become **persistent** (re-fire every premature `finish()` until a probe
+  ran and a finding was recorded), the out-of-band **oracle runs at finish** in chat, and a **Hard Floor**
+  refuses a prose-only hand-back while the objective is unmet and nothing was dispatched — forcing one
+  concrete probe. Genuine scope/authorization questions stay exempt, and it is capped per turn so
+  interactivity is never trapped. Default **off** (plain conversational chat); `/discipline off` to free it.
 - Runtime safety: **noise governor** (per-host pacing + 429/503 backoff), **untrusted-output nonce
   boundary**, signed **scope/authorization** gates (fail-closed).
 

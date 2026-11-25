@@ -1206,6 +1206,21 @@ def _handle_control(line, gate):
         os.environ["AEGIS_REQUIRE_STACK"] = "0"
         _emit("STACK", "FORCED-STACK OFF -- free loop (DS may run on its own; chat finish-gates off).")
         return "handled"
+    if low == "/discipline" or low.split(" ", 1)[0] in ("/discipline", "/disc", "/standby"):
+        # STANDBY DISCIPLINE live toggle (mirrors /forcedstack): arm the finish-gates (armed + persistent)
+        # AND the Hard Floor (refuse a no-action hand-back) in chat, and run the oracle at finish. Read per
+        # turn via AEGIS_STANDBY_DISCIPLINE, so the switch takes effect on the next turn. Bare = toggle;
+        # 'on'/'off' set it explicitly. Turn it ON to hunt, OFF for plain conversational chat.
+        arg = low.split(" ", 1)[1].strip() if " " in low else ""
+        cur = os.environ.get("AEGIS_STANDBY_DISCIPLINE", "0") == "1"
+        new = True if arg in ("on", "1", "true", "yes") else (False if arg in ("off", "0", "false", "no") else not cur)
+        os.environ["AEGIS_STANDBY_DISCIPLINE"] = "1" if new else "0"
+        _emit("DISCIPLINE", ("STANDBY-DISCIPLINE ON -- chat finish-gates armed + persistent, Hard Floor refuses "
+                             "no-action hand-backs (scope/authz questions exempt), oracle runs at finish. "
+                             "/discipline off to free it.") if new else
+                            "STANDBY-DISCIPLINE OFF -- free conversational chat (legacy; gates + Hard Floor off). "
+                            "/discipline on to drive execution.")
+        return "handled"
     if low in ("/claude", "/cli"):     # Claude via the local `claude` CLI (claude -p; no thinking toggle)
         _switch_brain("claude"); return "handled"
     if low in ("/brain", "/b"):        # cycle the drivers (keeps the current thinking mode)
@@ -4038,6 +4053,48 @@ def _require_stack():
     """True when AEGIS_REQUIRE_STACK=1: enforce stack usage + keep finish-gates on in chat (testing lever)."""
     return os.environ.get("AEGIS_REQUIRE_STACK", "0") == "1"
 
+def _standby_discipline():
+    """True when AEGIS_STANDBY_DISCIPLINE=1 (default off). The ARTEX-style execution-forcing
+    discipline ported into --chat standby: arm the finish-gates in chat AND make them PERSISTENT
+    (re-fire every premature finish until actually satisfied, bounded only by max_iter -- not the
+    legacy nudge-once-then-surrender), run the out-of-band ORACLE at finish in chat (ground-truth
+    verification, not self-report), and force a best-effort write-back/summary if chat hits the
+    iteration limit without finishing. Flag OFF => byte-identical to legacy behaviour."""
+    return os.environ.get("AEGIS_STANDBY_DISCIPLINE", "0") == "1"
+
+def _gates_armed(chat):
+    """Whether the finish-gates (verify/execute/record) and the finish-oracle are armed this run:
+    always on autonomous runs; in --chat only when forced-stack OR standby-discipline is on."""
+    return (not chat) or _require_stack() or _standby_discipline()
+
+def _gates_persist():
+    """Under standby-discipline the gates are PERSISTENT -- they re-fire on every premature finish()
+    until the underlying condition is genuinely met (probe run / finding recorded), instead of
+    nudging once and then honouring the next finish(). The outer max_iter bounds the loop."""
+    return _standby_discipline()
+
+# --- Phase 2: the planner HARD FLOOR ported into standby chat ----------------
+# ARTEX's planner forbids a 0-intent round while a goal is unmet and nothing is in flight
+# ("producing 0 intents = the task stalls"). Phase 1 only gates finish(); it leaves the
+# clever-talk-then-handback escape open -- a prose-only reply ends the chat turn and returns
+# control to the operator with ZERO dispatched. The Hard Floor closes that: a no-action
+# hand-back is refused while the objective is unmet, forcing one concrete probe instead.
+def _standby_hardfloor():
+    """True when the standby Hard Floor is active: standby-discipline on, and not explicitly
+    opted out with AEGIS_STANDBY_HARDFLOOR=0. Fires at most AEGIS_STANDBY_HARDFLOOR_MAX times
+    per turn (default 3) then yields, so the operator is never locked out of an interactive turn."""
+    return _standby_discipline() and os.environ.get("AEGIS_STANDBY_HARDFLOOR", "1") != "0"
+
+_HARDFLOOR_EXEMPT_CUES = ("authoriz", "permission", "in scope", "out of scope", "which target",
+    "credential", "clarif", "confirm scope", "confirm the target", "are these targets",
+    "may i proceed against", "do you confirm", "is this target")
+def _needs_operator_input(text):
+    """A genuine scope/authorization/clarification question is EXEMPT from the Hard Floor -- those
+    are turns where the agent SHOULD stop and ask (doctrine), not stall. A lazy 'want me to
+    proceed?' is NOT exempt: when told to prove something, the agent acts, it does not ask leave."""
+    t = (text or "").lower()
+    return any(c in t for c in _HARDFLOOR_EXEMPT_CUES)
+
 def _save_session(path, messages):
     """Persist the chat transcript + plan so a session can be resumed later. Atomic write."""
     try:
@@ -4272,6 +4329,9 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
     urgency_nudged = False            # the budget-urgency (drive the kill) nudge has fired once
     stack_used = False                # REQUIRE-STACK gate: a proven stack tool (_STACK_TOOLS) was invoked this run
     require_stack_nudged = False      # the require-stack nudge has fired once
+    acted_this_turn = False           # HARD FLOOR: any real dispatch (probe / stack tool / recorded finding) this turn
+    hardfloor_fires = 0               # HARD FLOOR: no-action hand-backs refused this turn (capped)
+    _HARDFLOOR_MAX = int(os.environ.get("AEGIS_STANDBY_HARDFLOOR_MAX", "3"))
     board_rescues = 0                 # BOARD-RESCUE circuit-breaker: times the board was pulled on a strategic stall
     _BOARD_MAX_RESCUES = 2            # cap board interventions so it stays an ADVISOR, never a crutch or a gate
     _BOARD_STALL_WINDOW = 7           # interaction-turns with NO new ledger progress that count as "stalled"
@@ -4601,6 +4661,21 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                        + (" (install_kali_tool)" if _can_install else "") + " or pick another approach, then "
                        "say 'continue'.\n", flush=True)
                     return None
+                # HARD FLOOR (Phase 2): refuse a no-action hand-back while the objective is unmet and
+                # NOTHING was dispatched this turn -- force one concrete probe instead of clever talk.
+                # Exempt genuine scope/authorization questions; capped so interactivity is never trapped.
+                if (depth == 0 and _standby_hardfloor() and not acted_this_turn and not finding_recorded
+                        and hardfloor_fires < _HARDFLOOR_MAX and not _needs_operator_input(msg.content or "")):
+                    hardfloor_fires += 1
+                    messages.append({"role": "user", "content":
+                        "[STANDBY HARD FLOOR] You are handing back to the operator without dispatching a single "
+                        "probe toward the objective and without asking an authorization/scope question. The "
+                        "objective is UNMET and nothing is in flight -- clever analysis is NOT progress. Take ONE "
+                        "concrete action NOW (a real tool call: fire the request / run a probe / run_tool / "
+                        "run_in_kali / record_finding), OR call finish() only if the objective is genuinely met "
+                        "(an oracle-verified finding) or truly exhausted. Do not reply in prose again without acting."})
+                    _p(f"{tag} [hard-floor] refused a no-action hand-back -- forcing a concrete step (#{hardfloor_fires})\n", flush=True)
+                    continue
                 return None  # genuine hand-back: a question, no open plan, or auto-continue budget spent
             messages.append({"role": "user", "content": "Continue: take the next action, or call finish()."})
             continue
@@ -4619,11 +4694,13 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                 continue
             if name in _STACK_TOOLS:                            # REQUIRE-STACK: a proven stack tool was used
                 stack_used = True
+                acted_this_turn = True                          # HARD FLOOR: a stack tool is a real dispatch
             if name in ("record_finding", "chain_state"):      # record-as-you-go tracking
                 turns_since_record = 0
                 interacted_since_record = False
             elif name in ("run_in_kali", "run_command", "run_background", "fetch_url", "render_page", "run_tool", "run_wrapped_tool"):
                 interacted_since_record = True
+                acted_this_turn = True                          # HARD FLOOR: a target interaction is a real dispatch
                 mutated_unverified = False   # an exercise/verify step -> a prior edit is now being tested
                 script_pending = None        # KILL-GATE: an execution happened -> no unrun script dangling
             try:
@@ -4756,6 +4833,7 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                             _rr.get("recorded") == "finding"
                             or str(_rr.get("status") or _rr.get("verdict") or "").lower() in ("verified", "recorded")):
                         finding_recorded = True
+                        acted_this_turn = True   # HARD FLOOR: a persisted finding is a real dispatch
                 except Exception:
                     pass
             if _stop_task:   # operator /stop'd during the tool; result is recorded, now end the task cleanly
@@ -4764,7 +4842,11 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
             if name == "finish":
                 # VERIFY-BEFORE-FINISH (board item 4): don't accept finish() if a file was edited but never
                 # exercised/verified. Nudge ONCE to verify; then honour the next finish() regardless.
-                if _require_stack() and not stack_used and not require_stack_nudged:
+                # REQUIRE-STACK gate (testing lever, AEGIS_REQUIRE_STACK=1): refuse the first finish() if the
+                # agent never used a proven stack tool -- i.e. it freewheeled with raw run_command/scripts
+                # instead of the discovery/planner/RAG/Kali/oracle machinery. Applies in chat too (that is the
+                # whole point: standby chat otherwise has NO gates). Nudges ONCE, then honours the next finish().
+                if (_require_stack() or _standby_discipline()) and not stack_used and (not require_stack_nudged or _gates_persist()):
                     require_stack_nudged = True
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({
                         "use_the_stack_first": True, "note": "AEGIS_REQUIRE_STACK is ON: you have NOT used the "
@@ -4775,7 +4857,7 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                         "finish(). The stack is the trustworthy path; freewheeling is not."})})
                     _p(f"{tag} [require-stack] agent tried to finish without using the stack -- nudged to use it\n", flush=True)
                     continue   # don't return the finish yet
-                if mutated_unverified and not verify_nudged and (not chat or _require_stack()):
+                if mutated_unverified and (not verify_nudged or _gates_persist()) and _gates_armed(chat):
                     verify_nudged = True
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({
                         "verify_before_finish": True, "note": "You edited files but have NOT functionally verified "
@@ -4786,7 +4868,7 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                     continue   # don't return the finish yet
                 # KILL-GATE (execute-before-finish): you wrote a probe/exploit script but never ran it. A
                 # script you don't execute proves nothing. Nudge ONCE; then honour the next finish().
-                if script_pending and not kill_nudged and (not chat or _require_stack()):
+                if script_pending and (not kill_nudged or _gates_persist()) and _gates_armed(chat):
                     kill_nudged = True
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({
                         "execute_before_finish": True, "note": f"You wrote {script_pending} but NEVER executed it "
@@ -4799,7 +4881,7 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                 # record_finding produced an oracle-VERIFIED result this run. Self-reported "oracle-confirmed"
                 # is a hallucination -- only the oracle verifies (ground-truth doctrine). Challenge ONCE: call
                 # record_finding with the real evidence and let the oracle rule; if it REJECTS, say so honestly.
-                if not finding_recorded and not record_nudged and (not chat or _require_stack()):
+                if not finding_recorded and (not record_nudged or _gates_persist()) and _gates_armed(chat):
                     _claim = args.get("summary", "") if isinstance(args, dict) else ""
                     if re.search(r"\b(verif|confirm|oracle|exploit|bypass|compromis|gained?\s+\w*\s*access|"
                                  r"admin\s+(access|privile)|jwt|token|auth\w*\s*bypass|critical|kill)\b",
@@ -4825,7 +4907,7 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
                 # live target and stamp it verified/rejected (ground truth). Append the verdict to the summary
                 # so the FINAL reflects the ORACLE, not the model's self-report (doctrine: only oracle-verified
                 # counts). depth==0 only (sub-agents don't own the ledger); best-effort, never blocks the finish.
-                if depth == 0 and not chat and _VF is not None:
+                if depth == 0 and (not chat or _standby_discipline()) and _VF is not None:
                     try:
                         _vr = _verify_run_candidates(run_only=True)
                         if _vr.get("candidates"):
@@ -4846,7 +4928,8 @@ def _agent_loop(client, model, thinking, messages, allowed_names, max_iter, gate
     # Force a best-effort, tool-less summary of what was accomplished / FOUND so far, so
     # evidence and partial findings survive (matters for pentest runs and plan-exec sub-agents
     # that exhaust exec_max_iter). Falls back to None only if even the summary call fails.
-    if not chat:
+    # Under standby-discipline this also runs in --chat so forced write-back survives the cap.
+    if not chat or _standby_discipline():
         try:
             messages.append({"role": "user", "content":
                 "You have reached the iteration limit WITHOUT calling finish(). Do NOT call any more "
@@ -5012,6 +5095,11 @@ def run_chat(model, thinking, gate, session_path=None, resume=False):
     print("  Reasoning mode: the SHORT form (/ds /kimi /qwen /llama ...) switches with thinking OFF (fast); "
           "the -think form (/ds-think /qwen-think ...) switches with thinking ON. /think /nothink toggle the "
           "current brain  |  thinking=" + ("on" if thinking else "off"), flush=True)
+    print("Stack: /forcedstack (force the proven stack -- refuse finish until a stack tool runs) · /freestack "
+          "(let DS run on its own)  |  forced=" + ("on" if os.environ.get("AEGIS_REQUIRE_STACK") == "1" else "off"), flush=True)
+    print("Discipline: /discipline on|off (ARTEX-style: finish-gates + Hard Floor + finish-oracle in chat; "
+          "on=hunt, off=plain chat)  |  discipline="
+          + ("on" if os.environ.get("AEGIS_STANDBY_DISCIPLINE") == "1" else "off"), flush=True)
     print("Also: /status (what am I doing) · /stop or Ctrl+C (abort the CURRENT task only -- the session "
           "stays open; breaks a streaming reply immediately, a running tool at its next safe point)", flush=True)
     print("Review: /summary (brief of this chat) · /search <text> (find it across the chat) · /scroll <ms> "

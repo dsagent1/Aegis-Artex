@@ -32,6 +32,7 @@ param(
   [switch]$AutoApprove,
   [switch]$Think,                         # deeper-reasoning (thinking) mode; OFF by default (fast chat mode)
   [switch]$RequireStack,                  # FORCE stack use: refuse finish() until a proven stack tool ran + keep finish-gates armed in chat
+  [switch]$Discipline,                    # STANDBY DISCIPLINE: arm finish-gates (persistent) + Hard Floor (refuse no-action hand-backs) + finish-oracle in chat (live toggle: /discipline on|off)
   [switch]$NoThink,                       # deprecated/no-op: non-thinking is the default now (kept so old invocations don't error)
   [string]$Session,
   [switch]$Resume,                        # load the saved session on start (default file is saved every turn but only picked up on request; or type /resume live)
@@ -78,6 +79,7 @@ $env:AEGIS_CF_HELPER = $CfHelper
 if ([string]::IsNullOrWhiteSpace($env:AEGIS_FALLBACK)) { $env:AEGIS_FALLBACK = $Fallback }
 if ($Target) { $env:AEGIS_TARGET = $Target }
 if ($RequireStack) { $env:AEGIS_REQUIRE_STACK = '1' } else { $env:AEGIS_REQUIRE_STACK = '0' }
+if ($Discipline) { $env:AEGIS_STANDBY_DISCIPLINE = '1' } else { $env:AEGIS_STANDBY_DISCIPLINE = '0' }
 
 # --- pick python: $env:AEGIS_PYTHON wins, else python on PATH ---
 $py = $env:AEGIS_PYTHON
