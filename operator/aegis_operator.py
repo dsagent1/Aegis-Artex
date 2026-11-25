@@ -1240,8 +1240,7 @@ def _handle_control(line, gate):
         _tmo = int(os.environ.get("AEGIS_HUNT_TIMEOUT", "600"))
         _emit("HUNT", f"dispatching frontier hunt (budget={budget}, agents={agents}, <={_tmo}s): {obj[:90]}")
         try:
-            with _Status(f"frontier hunt (budget={budget}, up to {_tmo}s)", timeout=_tmo + 60):
-                _res = t_hunt(obj, role="owner", budget=budget, agents=agents)
+            _res = t_hunt(obj, role="owner", budget=budget, agents=agents)   # streams [hunt] lines live itself
             _rj = json.loads(_res)
             _vf = _rj.get("verified", []) or []
             print(f"\n[hunt] {_rj.get('verified_count', 0)} oracle-VERIFIED finding(s)"
@@ -1636,14 +1635,41 @@ def t_hunt(objective, role="owner", budget=16, agents=2):
     cmd = [sys.executable, script, "--objective", str(objective), "--role", str(role),
            "--budget", str(int(budget)), "--agents", str(int(agents)), "--store", store]
     tmo = int(os.environ.get("AEGIS_HUNT_TIMEOUT", "600"))
-    stdout = stderr = ""; rc = None; timed_out = False
+    stderr = ""; rc = None; timed_out = False; _lines = []
+    # LIVE STREAM: forward agent_hunt_live's progress line-by-line (planner seeds / CLAIM / RESULT /
+    # verified count) so the operator SEES the hunt as it runs -- and can /stop a wrong target or
+    # objective early -- instead of a silent spinner. The child runs unbuffered; a watchdog enforces the
+    # wall-clock cap and honours operator /stop. Output is still captured for the verified-findings parse.
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=tmo)
-        stdout, stderr, rc = p.stdout or "", p.stderr or "", p.returncode
-    except subprocess.TimeoutExpired as e:
-        timed_out = True
-        stdout = (e.stdout or b"").decode("utf-8", "replace") if isinstance(e.stdout, (bytes, bytearray)) else (e.stdout or "")
+        proc = subprocess.Popen([sys.executable, "-u"] + cmd[1:], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"})
+    except Exception as _e:
+        return json.dumps({"engine": "agent_hunt_live(frontier)", "objective": objective,
+                           "error": repr(_e)[:200], "store": store})
+    _deadline = time.time() + tmo
+    def _hunt_watchdog(_p=proc, _dl=_deadline):
+        while _p.poll() is None:
+            if time.time() > _dl or _STOP_EVENT.is_set():
+                try: _p.kill()
+                except Exception: pass
+                return
+            time.sleep(1.0)
+    threading.Thread(target=_hunt_watchdog, daemon=True).start()
+    try:
+        for _ln in proc.stdout:
+            _ln = _ln.rstrip("\n")
+            _lines.append(_ln)
+            print(f"  [hunt] {_ln[:300]}", flush=True)
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+    rc = proc.returncode
+    timed_out = time.time() > _deadline
+    stdout = "\n".join(_lines)
     # ground truth: read the hash-chained ledger (the scheduler's stdout tally is not authoritative).
     verified = []
     try:
