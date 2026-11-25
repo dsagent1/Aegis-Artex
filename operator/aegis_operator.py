@@ -1656,13 +1656,32 @@ def t_hunt(objective, role="owner", budget=16, agents=2):
                 return
             time.sleep(1.0)
     threading.Thread(target=_hunt_watchdog, daemon=True).start()
+    # Tee every line to a per-hunt log so a second window can watch it live: tail -f <hlog>.
+    _hlog = (store[:-6] if store.endswith(".jsonl") else store) + ".log"
+    _hf = None
     try:
-        for _ln in proc.stdout:
+        _hf = open(_hlog, "w", encoding="utf-8")
+    except Exception:
+        _hf = None
+    print(f"  [hunt] live log -> {_hlog}   (tail -f to watch in another window)", flush=True)
+    # readline() (not `for ln in proc.stdout`) -- the iterator read-aheads ~8KB and would hold lines back,
+    # making the hunt look silent until a big chunk flushes. readline yields each line as it arrives.
+    try:
+        for _ln in iter(proc.stdout.readline, ""):
             _ln = _ln.rstrip("\n")
             _lines.append(_ln)
             print(f"  [hunt] {_ln[:300]}", flush=True)
+            if _hf:
+                try:
+                    _hf.write(_ln + "\n"); _hf.flush()
+                except Exception:
+                    pass
     except Exception:
         pass
+    finally:
+        if _hf:
+            try: _hf.close()
+            except Exception: pass
     try:
         proc.wait(timeout=5)
     except Exception:
