@@ -1636,6 +1636,26 @@ def t_hunt(objective, role="owner", budget=16, agents=2):
            "--budget", str(int(budget)), "--agents", str(int(agents)), "--store", store]
     tmo = int(os.environ.get("AEGIS_HUNT_TIMEOUT", "600"))
     stderr = ""; rc = None; timed_out = False; _lines = []
+    # PREFLIGHT the target: a hunt against an UNREACHABLE target doesn't die -- it crawls, every probe
+    # eating a connect-timeout, so the chat looks frozen for the whole run. Fail fast with a clear message
+    # instead (unless AEGIS_HUNT_NO_PREFLIGHT=1). "reachable" = ANY HTTP response (4xx/5xx is fine);
+    # only a connection failure/timeout counts as down.
+    _base = (os.environ.get("AEGIS_TARGET") or os.environ.get("AEGIS_TARGET_BASE") or "").strip()
+    if _base and os.environ.get("AEGIS_HUNT_NO_PREFLIGHT", "0") != "1":
+        try:
+            import requests as _rq
+            try:
+                import urllib3 as _u3; _u3.disable_warnings()
+            except Exception:
+                pass
+            _rq.get(_base, timeout=6, verify=False)   # any response = reachable
+        except Exception as _pe:
+            print(f"  [hunt] PREFLIGHT FAILED: target {_base} is unreachable ({type(_pe).__name__}).", flush=True)
+            return json.dumps({"engine": "agent_hunt_live(frontier)", "objective": objective, "store": store,
+                "verified_count": 0, "verified": [], "preflight_failed": True,
+                "error": f"target {_base} is UNREACHABLE ({type(_pe).__name__}) -- a hunt would stall timing out on "
+                         f"every probe. Bring the target up or set AEGIS_TARGET to a live one (e.g. the Juice Shop "
+                         f"mirror), then retry. (AEGIS_HUNT_NO_PREFLIGHT=1 to skip this check.)"})
     # LIVE STREAM: forward agent_hunt_live's progress line-by-line (planner seeds / CLAIM / RESULT /
     # verified count) so the operator SEES the hunt as it runs -- and can /stop a wrong target or
     # objective early -- instead of a silent spinner. The child runs unbuffered; a watchdog enforces the
