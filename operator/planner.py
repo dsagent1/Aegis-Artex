@@ -262,6 +262,10 @@ def _seed_priority(move, objective=""):
     blob = " ".join(str(move.get(k) or "") for k in ("vuln_class", "action", "technique", "angle")).lower()
     sc = 0.0
     W = {"auth_bypass": 9, "sql_raw": 9, "sql": 8, "broken-authentication": 7, "injection": 5,
+         # a GROUNDED n-day / patch-diff probe on a (clumpiness-ranked) real plugin version is top-value --
+         # it is a targeted KNOWN gap, not a sweep -- so it must outrank the generic breadth classes and
+         # actually get dispatched within the small budget (else the develop-from-diff path starves).
+         "n-day": 8, "n_day": 8, "patch_diff": 8, "patch-diff": 8, "known-cve": 7, "ndiff": 8,
          "idor": 6, "broken-access": 6, "access-control": 6, "xss": 6, "cross-site-scripting": 6,
          "ssrf": 5, "mass-assign": 5, "mass_assign": 5, "file-upload": 5, "file_upload": 5,
          "nuclei": 4, "known-vuln": 4, "security-misconfig": 4, "misconfig": 4, "nested-write": 4,
