@@ -40,19 +40,7 @@ def _cf_sem():
     return _CF_SEM
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-def _load_cf_models():
-    """Load the Cloudflare slug map, gracefully: real file, else the shipped .example, else empty.
-    A fresh clone without Cloudflare configured must still import the board stack (installability)."""
-    for name in ("cf_models.json", "cf_models.json.example"):
-        p = os.path.join(HERE, name)
-        if os.path.exists(p):
-            try:
-                d = json.load(open(p, encoding="utf-8"))
-                return {k: v for k, v in d.items() if not str(k).startswith("_")}  # drop _note
-            except Exception:
-                pass
-    return {}
-MODELS = _load_cf_models()
+MODELS = json.load(open(os.path.join(HERE, "cf_models.json"), encoding="utf-8"))
 
 _SECRET_ENV_LOADED = False
 def load_secret_env():
@@ -135,12 +123,14 @@ CODE_FLAVOURED_ROLE = (
     "assertion, or a rendered-output check) plus the expected PASS condition.\n"
     "Output ONLY a numbered list of such suggestions - no preamble, no essay. Keep each self-contained."
 )
-# Code-flavoured roles for the live CF coders. (kimi-k2.7-code / deepseek-r1-distill were retired on
-# Cloudflare 2026-11-20 -> 410; removed. deepseek-cf = DeepSeek flash via CF, the direct-DS failover.)
+# kimi-k2.7-code is a first-class exploit-CODE writer (like qwen2.5-coder); kimi-k2.6 is a strong
+# general consultant. Both need the CF Workers PAID plan -- until then they 403 and are skipped
+# gracefully (see _post), so listing them here is safe and they activate the moment the plan is on.
 ROLE_PROMPTS = {"qwen2.5-coder-32b": CODE_FLAVOURED_ROLE,
-                "deepseek-cf": CODE_FLAVOURED_ROLE,     # DeepSeek flash via Cloudflare (direct-DS failover)
-                "llama-3.3-70b": CODE_FLAVOURED_ROLE,   # fast, direct exploit-code writer
-                "llama-4-scout": CODE_FLAVOURED_ROLE}   # Llama-4 MoE coder (bake-off winner)
+                "kimi-k2.7-code": CODE_FLAVOURED_ROLE,
+                "llama-3.3-70b": CODE_FLAVOURED_ROLE,   # fast, direct exploit-code writer (CF paid)
+                "llama-4-scout": CODE_FLAVOURED_ROLE,   # Llama-4 MoE coder (bake-off winner, CF paid)
+                "deepseek-r1-distill-32b": CODE_FLAVOURED_ROLE}  # reasoning-coder (CF paid)
 
 def _role_for(model: str) -> str:
     """Baked-in system role for a model, matched by friendly name or resolved @cf slug."""
@@ -169,7 +159,12 @@ def _as_text(c) -> str:
 # EMPTY -> the raw reasoning_content leaks. Fix (skill gotcha): give reasoning models a generous token
 # FLOOR so they finish thinking AND emit the answer. Tunable via AEGIS_REASONING_TOKENS.
 _REASONING_HINTS = ("kimi", "moonshot", "qwq", "r1-distill", "deepseek-r1", "reasoning", "thinking",
-                    "gpt-oss", "glm", "gemma", "nemotron")  # these "think" too -> need the token floor
+                    "gpt-oss", "glm", "gemma", "nemotron",
+                    # deepseek-v4.1-flash (the live CF-DS model, and the remap target for qwq / r1-distill /
+                    # deepseek-v4-pro-cf) is ALSO a thinking model: it emits ~800-1450 chars of
+                    # reasoning_content and starves a small max_tokens -> empty code -> the novel-code
+                    # `no_code` stall. Catch it so it gets the AEGIS_REASONING_TOKENS floor + long timeout.
+                    "deepseek-v4.1", "v4.1-flash", "deepseek-ai")  # these "think" too -> need the token floor
 
 
 def _is_reasoning(model: str) -> bool:
@@ -204,11 +199,6 @@ def _post(model: str, system: str, user: str, max_tokens: int, temperature: floa
     _payload = {"model": resolve(model),
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "max_tokens": max_tokens, "temperature": temperature}
-    # DeepSeek (incl. the CF deepseek-cf flash failover) THINKS by default: reasoning_content eats the
-    # token budget and `content` comes back truncated/empty. This is an answer-only path, so disable it --
-    # mirroring the direct-DS calls. CF accepts a top-level `thinking` field (see code_review.py).
-    if "deepseek" in resolve(model).lower():
-        _payload["thinking"] = {"type": "disabled"}
     if effort and effort != "none":                  # gpt-oss & compatible; sent only when configured
         _payload["reasoning_effort"] = effort
     body = json.dumps(_payload).encode()

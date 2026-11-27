@@ -14,7 +14,7 @@ returned session, in addition to the cookie jar:
 All of this is transparent to callers: it is still `session_for_role(role) -> requests.Session`.
 
 Config via env (point at the mirror on the box, NOT in code -- same doctrine as AEGIS_DB_USER etc.):
-  AEGIS_ROLE_MAP         JSON {role: identity}, e.g. {"owner":"Owner User","finance":"Finance User",...}
+  AEGIS_ROLE_MAP         JSON {role: identity}, e.g. {"owner":"Alex Morgan","finance":"Fiona Clarke",...}
   AEGIS_LOGIN_URL        login endpoint (default {base}/api/auth/login)
   AEGIS_LOGIN_PIN        shared PIN (default AEGIS_TEST_PIN, else 000000)
   AEGIS_LOGIN_ID_FIELD   login body field for the identity (default "name")
@@ -61,7 +61,22 @@ def from_env(base):
         role_map = json.loads(os.environ.get("AEGIS_ROLE_MAP", "") or "{}")
     except Exception:
         role_map = {}
+    # AEGIS_HOST_HEADER: force a Host header on every request. Lets the hunt reach an origin that vhosts
+    # on Host (hit the origin IP directly with Host: chikov.com to bypass a CF WAF / wrong default vhost),
+    # so surface discovery reads the REAL app instead of a 403/other-vhost -> no more phantom surfaces.
+    host_hdr = (os.environ.get("AEGIS_HOST_HEADER") or "").strip() or None
     if not isinstance(role_map, dict) or not role_map:
+        # No role map: still hand back a Host-override factory if AEGIS_HOST_HEADER is set; else None.
+        if host_hdr:
+            import requests as _rq
+            try: _rq.packages.urllib3.disable_warnings()
+            except Exception: pass
+            def _host_factory(role=None):
+                s = _rq.Session(); s.verify = False
+                s.headers["Host"] = host_hdr
+                s.headers.setdefault("User-Agent", "Mozilla/5.0")
+                return s
+            return _host_factory
         return None
     role_map = {str(k).lower(): v for k, v in role_map.items()}
     import requests
@@ -95,6 +110,8 @@ def from_env(base):
         def __init__(self, ident):
             super().__init__()
             self.verify = False
+            if host_hdr:                   # AEGIS_HOST_HEADER: reach the real vhost behind a WAF/origin
+                self.headers["Host"] = host_hdr
             self._ident = ident            # None => anonymous role (never re-auths to a privileged id)
             self._authing = False          # recursion guard around the login call
 

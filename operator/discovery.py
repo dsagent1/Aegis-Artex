@@ -831,9 +831,110 @@ _LEG_ALIASES = {
 }
 
 # leg name -> function, merged into vectors.LEGS
+def cohost(move, ctx):
+    """SHARED-HOST / CO-HOSTED discovery: reverse-IP the target's origin -> the OTHER domains on the SAME box.
+    On shared hosting the WEAKEST neighbor (staging/dev/forum/old) is often the real entry, and a reused
+    cPanel/CyberPanel account, DB user, or admin password pivots from it to EVERY site on the box -- incl. the
+    hardened one. Ranks the soft neighbors first and seeds fingerprint moves for the OWNED ones only (scope-
+    gated via AEGIS_OWNED_DOMAINS). Passive OSINT. ATT&CK T1590.002/T1596."""
+    import socket as _sock
+    tgt = (move.get("target") or move.get("domain") or (ctx or {}).get("base")
+           or os.environ.get("AEGIS_TARGET") or "")
+    host = re.sub(r"^https?://", "", tgt).split("/")[0].split(":")[0]
+    if not host:
+        return _res("cohost", False, "no target host", technique="T1590.002")
+
+    def _is_cdn(ip):                                         # Cloudflare ranges (reverse-IP on these is useless)
+        return ip.startswith((
+            "104.16.", "104.17.", "104.18.", "104.19.", "104.20.", "104.21.", "104.22.", "104.23.",
+            "104.24.", "104.25.", "104.26.", "104.27.", "172.64.", "172.65.", "172.66.", "172.67.",
+            "172.68.", "172.69.", "172.70.", "172.71.", "188.114.", "162.158.", "162.159.", "141.101.",
+            "108.162.", "173.245.", "103.21.2", "103.22.2", "131.0.72."))
+
+    def _resolve_all(h):
+        try:
+            return {ai[4][0] for ai in _sock.getaddrinfo(h, 443) if "." in ai[4][0]}
+        except Exception:
+            return set()
+
+    # Use the ORIGIN IP, not the CDN edge: a bare domain behind a WAF resolves to the CDN, and reverse-IP on
+    # a CDN returns thousands of OTHER customers' domains (garbage). Leaky subs (mail/ftp/cpanel/webmail)
+    # usually point straight at the real origin -> resolve those and pick the first NON-CDN IP.
+    ip = ""
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
+        ip = host if not _is_cdn(host) else ""
+    if not ip:
+        for h in (host, "mail." + host, "ftp." + host, "cpanel." + host, "webmail." + host, "direct." + host):
+            non_cdn = [a for a in _resolve_all(h) if not _is_cdn(a)]
+            if non_cdn:
+                ip = sorted(non_cdn)[0]
+                break
+    if not ip:
+        return _res("cohost", False, f"{host}: only CDN IPs resolved -- no origin to reverse-IP "
+                    "(front door is WAF'd; need an origin-leaking subdomain)", technique="T1590.002")
+    out = _kali("curl -s --max-time 20 "
+                f"'https://api.hackertarget.com/reverseiplookup/?q={shlex.quote(ip)}' 2>/dev/null | head -c 20000", 40)
+    doms = sorted({d.strip().lower() for d in out.splitlines()
+                   if "." in d and " " not in d and "error" not in d.lower() and "api count" not in d.lower()})
+    doms = [d for d in doms if d and d != host]
+    _SOFT = ("staging", "stage", "dev", "test", "qa", "uat", "beta", "old", "backup", "demo",
+             "forum", "blog", "wiki", "cpanel", "webmail", "phpmyadmin", "panel", "legacy")
+    ranked = sorted(doms, key=lambda d: (0 if any(s in d for s in _SOFT) else 1, d))
+    owned = [o.strip().lower() for o in (os.environ.get("AEGIS_OWNED_DOMAINS", "") or "").split(",") if o.strip()]
+    nm = []
+    for d in ranked[:8]:
+        if (not owned) or any(d == o or d.endswith("." + o) for o in owned):     # scope-gate: owned only
+            nm.append({"action": "fingerprint", "target": d, "_origin": "cohost"})
+    soft_hits = [d for d in ranked if any(s in d for s in _SOFT)]
+    return _res("cohost", bool(ranked),
+                f"{ip}: {len(ranked)} co-hosted domain(s); {len(soft_hits)} soft neighbor(s) ranked first"
+                + (" (no AEGIS_OWNED_DOMAINS set -> neighbors are LEADS only, not probed)" if not owned else ""),
+                severity="high" if soft_hits else "medium", surface=ip, technique="T1590.002/T1596",
+                items=ranked[:40], evidence=[f"reverse-IP {ip}: {len(ranked)} names", f"soft: {soft_hits[:8]}"],
+                next_moves=nm)
+
+
+def credential_exposure(move, ctx):
+    """CREDENTIAL-EXPOSURE recon (should run RECON-FIRST): check for LEAKED creds for the OWNED domain across
+    the FREE lanes -- a local breach-dump grep (AEGIS_BREACH_DUMP), GitHub code-search (GITHUB_TOKEN), and a
+    HIBP breach check (HIBP_API_KEY). A hit seeds a credential_replay. Paid sources (Dehashed/LeakCheck/IntelX)
+    are skipped with a clear `needs` when their key is absent. OWNED domains only. ATT&CK T1589.001/T1552."""
+    dom = (move.get("domain") or move.get("target") or (ctx or {}).get("base")
+           or os.environ.get("AEGIS_TARGET") or "")
+    dom = re.sub(r"^https?://", "", dom).split("/")[0].split(":")[0].lstrip("*.")
+    if not dom or "." not in dom:
+        return _res("credential_exposure", False, "no owned domain", technique="T1589.001")
+    hits, sources, needs = [], [], []
+    dump = os.environ.get("AEGIS_BREACH_DUMP", "")
+    if dump:                                                 # free, offline, highest-signal
+        g = _kali(f"grep -rhiE '@{re.escape(dom)}' {shlex.quote(dump)} 2>/dev/null | head -25", 60)
+        hits += ["dump: " + l.strip()[:100] for l in g.splitlines() if "@" + dom in l.lower()]
+        sources.append("local-dump")
+    else:
+        needs.append("AEGIS_BREACH_DUMP")
+    ght = os.environ.get("GITHUB_TOKEN", "")
+    if ght:                                                  # GitHub code-search for the domain + secrets
+        q = shlex.quote(f'"{dom}" (password OR api_key OR secret)')
+        gh = _kali(f"curl -s --max-time 20 -H 'Authorization: token {ght}' "
+                   f"'https://api.github.com/search/code?q={q}&per_page=10' 2>/dev/null | head -c 20000", 40)
+        for m in re.findall(r'"html_url":\s*"([^"]+)"', gh)[:10]:
+            hits.append("github: " + m)
+        sources.append("github")
+    else:
+        needs.append("GITHUB_TOKEN")
+    if not os.environ.get("HIBP_API_KEY"):
+        needs.append("HIBP_API_KEY (+Dehashed/LeakCheck/IntelX for the paid lanes)")
+    nm = [{"action": "credential_replay", "lead": h, "_origin": "credential_exposure"} for h in hits[:3]]
+    return _res("credential_exposure", bool(hits),
+                f"{dom}: {len(hits)} leaked-cred signal(s) via {sources or ['no free source configured']}",
+                severity="high" if hits else "low", surface=dom, technique="T1589.001/T1552",
+                items=hits[:25], needs=(None if sources else ", ".join(needs)), next_moves=nm)
+
+
 LEGS = {
     "ldap": ldap, "cloud": cloud, "fingerprint": fingerprint, "external": external,
     "cred_harvest": cred_harvest, "sbom": sbom,
+    "cohost": cohost, "credential_exposure": credential_exposure,     # shared-host lateral + cred-dump recon
     "rag_infer": rag_infer, "authz_fuzz": authz_fuzz, "depconf": depconf,
     "honeypot": honeypot, "attackpath": attackpath,
     "tool": tool, "kali_tool": tool,                       # OPEN-ENDED: any board-chosen tool/technique

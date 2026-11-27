@@ -847,6 +847,14 @@ class IterativeHunt:
         _init_budget = self.cost_ceiling if self.mech5 else self.budget
         _noise = max(self.max_noise, _init_budget) if self.mech5 else self.max_noise
         st = HuntState(budget=_init_budget, noise_left=_noise)
+        # AUTONOMOUS VPN: connect the tester's own egress once at run start (opt-in AEGIS_VPN_ROTATE=1)
+        # so the whole hunt runs from a clean IP; the per-move hook below rotates country on a ban.
+        # Shared by all three modes (they all call this run()). Fail-open.
+        try:
+            import vpn_guard as _vpng
+            _vpng.ensure_connected()
+        except Exception:
+            _vpng = None
         st.queue = [m for m in self.seed_moves if self._novel(m, st)]     # MODE 1: anchor seeds first
         # RUN MONITOR: heartbeat + in-process watchdog for HANG detection (a wedged probe can't freeze the
         # run -- per-attempt hard timeout below) + wall-clock budget. Offline-safe; AEGIS_MONITOR=0 disables.
@@ -970,6 +978,14 @@ class IterativeHunt:
                 except Exception as e:            # one bad vector must not abort the whole budget (Pass 2 #22)
                     result = {"status": -1, "body": f"[attempt error] {e}", "move": move}
             verdict, receipt = self.oracle(result)
+            # AUTONOMOUS VPN: feed the target's response status to the rotation guard; it rotates the
+            # egress country itself on a sustained ban streak (403/429/conn-fail). Opt-in + fail-open.
+            try:
+                if _vpng is not None:
+                    _vpng.note_status((result or {}).get("status"),
+                                      (move or {}).get("surface") or target)
+            except Exception:
+                pass
             try:                                          # COVERAGE: this parity class has now been probed
                 import coverage as _cov
                 if not (result or {}).get("blocked"):

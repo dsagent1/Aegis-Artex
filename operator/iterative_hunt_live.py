@@ -277,8 +277,7 @@ def make_oracle(store: FindingStore, oracle_factory=None, session_for_role=None,
                         provenance={"provider": "novel_code", **_reach_prov(move, result)})
             fid = store.record_candidate(f)
             store._transition(fid, "verified", "probe.oracle",
-                              {"verdict": pr.get("verdict"), "notes": pr.get("notes", "")[:300],
-                               "deception": pr.get("deception", "")})   # #4: carry the control verdict
+                              {"verdict": pr.get("verdict"), "notes": pr.get("notes", "")[:300]})
             return ("verified", {"weakness": f.claim_type, "layer": (_reach.direction_of(move) if _reach else ""),
                                  "origin": (_reach.finding_origin(move, result) if _reach else "novel"),
                                  "probe": {k: pr.get(k) for k in ("verdict", "notes")}})
@@ -688,6 +687,46 @@ def run_hunt(objective, role="owner", budget=40, store_path=None, base=BASE,
     except Exception:
         pass
     store = FindingStore(store_path or os.path.join(HERE, "hunt_findings.jsonl"))
+    # AUTONOMOUS reachability (self-diagnosing, fail-open):
+    #  (1) proxy_guard: owner opt-in (AEGIS_AUTO_PROXY=1) -- route the hunt's egress through the VPN'd WSL
+    #      proxy so a target IP-ban can't blind the probes (reachability of an owner-controlled asset).
+    #  (2) origin_resolver: auto-detect a WAF'd front door, find the leaked origin, confirm the real app via
+    #      Host:, and set AEGIS_HOST_HEADER + rebind `base` -> discovery reads the REAL surface, not a phantom.
+    try:
+        import proxy_guard
+        proxy_guard.ensure(base)
+    except Exception:
+        pass
+    try:
+        import origin_resolver
+        _ores = origin_resolver.resolve(base)
+        if _ores.get("origin_ip"):
+            print(f"[origin] {_ores['reason']}", flush=True)
+            base = _ores["base"]
+    except Exception:
+        pass
+    # AUTO WordPress plugin-version harvest: a hardened WP scrubs the CORE version (generator / core ?ver=)
+    # but LEAKS plugin/theme versions (?ver= + readme.txt Stable tag). Plugins are the real attack surface
+    # (most WP CVEs). Harvest them and SEED each as a real, version-stamped lead (surface + version -> the
+    # code bench / patch_differ chase a public exploit / patch-diff). Auto-runs on a WP target. Gate AEGIS_WP_ENUM=0.
+    _wp_leads = []
+    if str(os.environ.get("AEGIS_WP_ENUM", "1")).lower() not in ("0", "false", "no", "off"):
+        try:
+            import wp_enum
+            _wpl = wp_enum.leads(base, os.environ.get("AEGIS_HOST_HEADER") or None)
+            _lds = _wpl.get("leads", [])
+            if _lds or _wpl.get("plugins"):
+                print("[wp-enum] " + str(len(_wpl.get("plugins", []))) + " plugin(s); version leads: "
+                      + ", ".join(f"{L['component']} {L['version']}" for L in _lds[:10]), flush=True)
+                for L in _lds:                                        # version-stamped plugin/theme leads
+                    _wp_leads.append({"action": "web", "surface": L["surface"], "vuln_class": "known-cve",
+                                      "angle": f"{L['component']} {L['version']}", "component": L["component"],
+                                      "version": L["version"], "_origin": "wp_enum"})
+                for rt in _wpl.get("wp_json_routes", [])[:10]:        # real wp-json routes (behavioral)
+                    _wp_leads.append({"action": "web", "surface": "/wp-json" + rt,
+                                      "vuln_class": "authz", "_origin": "wp_enum"})
+        except Exception as _e:
+            print(f"[wp-enum] skipped: {_e!r}", flush=True)
     # AUTH (was F1, never wired into the operator CLI path): if the caller didn't supply session_for_role,
     # build it from the env (AEGIS_ROLE_MAP + AEGIS_LOGIN_PIN) so seeds run AUTHENTICATED. Without this the
     # CLI ran every move UNAUTHENTICATED -> stateful setup (POST /api/invoices) 401 -> no plant -> before==
@@ -712,6 +751,8 @@ def run_hunt(objective, role="owner", budget=40, store_path=None, base=BASE,
     except Exception:
         sess = None
     seeds = sess.initial_seeds() if sess else []
+    if _wp_leads:                                        # real plugin/theme version leads first (grounded)
+        seeds = [dict(m, role=m.get("role", role)) for m in _wp_leads] + list(seeds)
     # SURFACE-AWARE anchors: caller-supplied seed moves against REAL enumerated routes go FIRST, so the
     # loop probes endpoints that actually exist (not board-guessed paths) before spending free budget.
     if extra_seeds:

@@ -66,6 +66,14 @@ _DISCOVERY = {
     "depconf": "depconf", "dependency_confusion": "depconf", "typosquat": "depconf",
     "honeypot": "honeypot", "deception": "honeypot",
     "attackpath": "attackpath", "attack_path": "attackpath", "path_analysis": "attackpath",
+    # shared-host / co-hosted lateral (recon.cohost, lateral.shared_host)
+    "cohost": "cohost", "reverse_ip": "cohost", "co_hosted": "cohost", "shared_host": "cohost",
+    "shared_hosting": "cohost", "neighbor": "cohost", "lateralmovement": "cohost", "shared_host_lateral": "cohost",
+    # credential-exposure / reuse recon (credaccess.exposure, credaccess.reuse)
+    "credential_exposure": "credential_exposure", "cred_exposure": "credential_exposure",
+    "credentialaccess": "credential_exposure", "credential_access": "credential_exposure",
+    "breach_dump": "credential_exposure", "leaked_credentials": "credential_exposure",
+    "credential_reuse": "credential_exposure", "password_reuse": "credential_exposure", "cred_reuse": "credential_exposure",
 }
 
 
@@ -100,12 +108,16 @@ def crawl_surfaces(base, cap=None):
     cap = int(cap or os.environ.get("AEGIS_CRAWL_CAP", "150")); js_cap = int(os.environ.get("AEGIS_CRAWL_JS", "12"))
     import time as _time
     _tries = int(os.environ.get("AEGIS_CRAWL_RETRIES", "4"))
+    _host_hdr = (os.environ.get("AEGIS_HOST_HEADER") or "").strip() or None
     def _get1(u):
         try:
             import requests as _rq
             try: _rq.packages.urllib3.disable_warnings()
             except Exception: pass
-            r = _rq.get(u, timeout=15, verify=False, headers={"User-Agent": "aegis-crawler"}, allow_redirects=True)
+            _h = {"User-Agent": "aegis-crawler"}
+            if _host_hdr:                      # reach the real vhost behind a WAF/origin (auto-set by origin_resolver)
+                _h["Host"] = _host_hdr
+            r = _rq.get(u, timeout=15, verify=False, headers=_h, allow_redirects=True)
             return r.text, r.status_code
         except Exception:
             try:
@@ -466,13 +478,21 @@ class Planner:
         if not board or not cands:
             return cands[:keep]
         brief = [{"id": t.get("id"), "class": t.get("class"), "platforms": t.get("applies_to"),
-                  "tactics": t.get("mitre_tactics"), "desc": (t.get("desc", "") or "")[:120]} for t in cands]
-        sysp = ("You are the Planner's RELEVANCE FILTER on an AUTHORIZED, contained assessment. Given the "
-                "TARGET ENVIRONMENT and CANDIDATE techniques (from the techniques DB + MITRE ATT&CK), select "
-                "ONLY techniques that are APPLICABLE to THIS environment -- platform/stack/surface + task "
-                "level must fit. DROP anything irrelevant (e.g. Windows/Active-Directory or mobile/cloud "
-                "techniques against a Linux web app, or techniques whose platform doesn't match). Output "
-                "ONLY a JSON array, best-first: [{\"id\":\"..\",\"reason\":\"<=12 words why it applies here\"}]. "
+                  "tactics": t.get("mitre_tactics"), "desc": (t.get("desc", "") or "")[:120],
+                  "effort": t.get("effort") or t.get("cost"),            # easy/fast hints if the DB carries them
+                  "wins": t.get("wins") or t.get("_ev") or t.get("verified_count"),  # recent-success signal
+                  "last_win": t.get("last_win") or t.get("last_verified")} for t in cands]
+        sysp = ("You are the Planner's APPROACH ADVISOR on an AUTHORIZED, contained assessment. Given the "
+                "TARGET ENVIRONMENT and CANDIDATE approaches (techniques DB + learned wins + MITRE ATT&CK), "
+                "advise WHICH to push and IN WHAT ORDER. First DROP anything that does not fit this "
+                "platform/stack/surface/task-level (e.g. Windows/AD or mobile/cloud techniques vs a Linux "
+                "web app). Then ORDER the rest BEST-FIRST by: (1) FIT to this environment; (2) EFFORT/ROI -- "
+                "prefer the EASY, FAST, high-yield routes (recon, CREDENTIAL-EXPOSURE / breach-dumps, "
+                "SHARED-HOST pivot via the weakest co-hosted site, KNOWN-CVE) BEFORE the hard/novel/0-day "
+                "ones; (3) RECENCY of success -- a 'wins'/'last_win' approach that verified recently here or "
+                "on a similar target ranks higher. Aim for the SHORTEST path to a confirmed foothold, not the "
+                "cleverest; the hard way is a fallback. Output ONLY a JSON array, best-first: "
+                "[{\"id\":\"..\",\"reason\":\"<=14 words: why it fits + why early (easy/fast/recent-win)\"}]. "
                 "No prose, no fenced block.")
         raw = self._board(sysp, json.dumps({"environment": fp, "candidates": brief})[:8000])
         chosen = {}
