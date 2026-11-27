@@ -37,7 +37,23 @@ def _reach_tags(move, result=None):
 
 
 def _reach_prov(move, result=None):
-    return _reach.finding_provenance(move, result) if _reach else {}
+    try:
+        prov = (_reach.finding_provenance(move, result) if _reach else {}) or {}
+    except Exception:
+        prov = {}
+    # stash the dispatch-critical move fields so an INDEPENDENT retest can re-run the EXACT probe (not a
+    # lossy claim_type->action guess). Faithful re-dispatch is what makes reproduced/fixed/inconclusive mean
+    # anything; without the real move a retest silently mis-routes and emits a misleading verdict.
+    try:
+        if isinstance(move, dict):
+            prov["move"] = {k: move.get(k) for k in
+                            ("action", "surface", "path", "verify_path", "collection", "owner_role",
+                             "attacker_roles", "method", "body", "param", "role", "token", "technique",
+                             "sample", "n", "create", "ref", "inject")
+                            if move.get(k) is not None}
+    except Exception:
+        pass
+    return prov
 
 BASE = os.environ.get("AEGIS_TARGET", "https://localhost:8443")
 _DESTRUCTIVE = re.compile(r"\b(DELETE\s+FROM|DROP\s+(TABLE|DATABASE|SCHEMA)|TRUNCATE|rm\s+-rf)\b", re.I)
@@ -323,6 +339,25 @@ def make_oracle(store: FindingStore, oracle_factory=None, session_for_role=None,
                               {"surface": idr.get("surface"), "leads": leads[:8], "checked": idr.get("checked")})
             return ("verified", {"weakness": f.claim_type, "surface": idr.get("surface"),
                                  "leads": leads[:6], "n_leads": idr.get("n_leads")})
+        jw = result.get("jwt")
+        if jw is not None:                                    # JWT signature-bypass forgery (broken-auth)
+            if jw.get("verdict") != "verified":
+                return ("rejected", {"detail": jw.get("note") or "forged token not accepted / control not denied",
+                                     "route": jw.get("route"), "control_status": jw.get("control_status")})
+            f = Finding(claim_type="broken_auth.jwt_forgery",
+                        summary=("JWT " + str(jw.get("vector", "forge")) + " accepted at " + str(jw.get("route"))
+                                 + " with forged admin claims; no-token control denied ("
+                                 + str(jw.get("control_status")) + ") -- signature verification bypassed"),
+                        severity="high",
+                        evidence=[asdict(Evidence(kind="note", detail=json.dumps(jw)[:300]))],
+                        coverage_tags=[f"surface:{jw.get('route','')}", f"technique:jwt-{jw.get('vector','forge')}",
+                                       "class:broken-authentication"] + _reach_tags(move, result),
+                        provenance={"provider": "jwt", **_reach_prov(move, result)})
+            fid = store.record_candidate(f)
+            store._transition(fid, "verified", "jwt.forgery",
+                              {"vector": jw.get("vector"), "route": jw.get("route"),
+                               "forged_status": jw.get("forged_status"), "control_status": jw.get("control_status")})
+            return ("verified", {"weakness": f.claim_type, "vector": jw.get("vector"), "route": jw.get("route")})
         ma = result.get("massassign")
         if ma is not None:                                    # mass assignment / auto-binding
             if ma.get("verdict") != "verified":
@@ -719,12 +754,38 @@ def run_hunt(objective, role="owner", budget=40, store_path=None, base=BASE,
                 print("[wp-enum] " + str(len(_wpl.get("plugins", []))) + " plugin(s); version leads: "
                       + ", ".join(f"{L['component']} {L['version']}" for L in _lds[:10]), flush=True)
                 for L in _lds:                                        # version-stamped plugin/theme leads
+                    # a confirmation GET on the plugin surface ...
                     _wp_leads.append({"action": "web", "surface": L["surface"], "vuln_class": "known-cve",
                                       "angle": f"{L['component']} {L['version']}", "component": L["component"],
                                       "version": L["version"], "_origin": "wp_enum"})
+                    # ... AND the GROUNDED n-day developer: a KNOWN gap is not guessing -- locate the change
+                    # (public exploit / patch-diff / advisory) and develop a TARGETED probe; only fall to novel
+                    # when fully patched. Fires the patch_diff leg (fingerprint-trust gated, offline-safe).
+                    _wp_leads.append({"action": "patch_diff", "surface": L["surface"],
+                                      "vuln_class": "n-day", "angle": f"{L['component']} {L['version']} n-day",
+                                      "component": L["component"], "version": L["version"],
+                                      "layer": "code", "_origin": "wp_enum",
+                                      "why_novel": f"develop a probe for {L['component']} {L['version']} from its "
+                                                   "patch diff / public advisory (known gap, targeted -- not guessing)"})
                 for rt in _wpl.get("wp_json_routes", [])[:10]:        # real wp-json routes (behavioral)
                     _wp_leads.append({"action": "web", "surface": "/wp-json" + rt,
                                       "vuln_class": "authz", "_origin": "wp_enum"})
+                # CLUMPINESS: vulnerabilities cluster -- spend budget on the CVE-DENSE plugins first (likelier
+                # to hide more, undiscovered gaps, and where escalation chains start). Rank the enumerated
+                # components by CVE density and reorder the leads densest-first. Gate AEGIS_CLUMPINESS=0;
+                # needs live research (AEGIS_CVE_RESEARCH), offline-safe (score 0 -> order unchanged).
+                if str(os.environ.get("AEGIS_CLUMPINESS", "1")).lower() not in ("0", "false", "no", "off"):
+                    try:
+                        import cve_research as _cvr
+                        _dens = {d["component"]: d["score"]
+                                 for d in _cvr.rank_by_density([(L["component"], L["version"]) for L in _lds])}
+                        if any(_dens.values()):
+                            _wp_leads.sort(key=lambda m: _dens.get(m.get("component", ""), 0.0), reverse=True)
+                            _top = sorted(_dens.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                            print("[clumpiness] CVE-density order: "
+                                  + ", ".join(f"{c}={s}" for c, s in _top if s), flush=True)
+                    except Exception:
+                        pass
         except Exception as _e:
             print(f"[wp-enum] skipped: {_e!r}", flush=True)
     # AUTH (was F1, never wired into the operator CLI path): if the caller didn't supply session_for_role,
@@ -871,7 +932,21 @@ def run_hunt(objective, role="owner", budget=40, store_path=None, base=BASE,
             except Exception:
                 _disc = []
             _roles = sorted({role, (authz_baseline_role or "")} - {""})
-            _a = assurance.assess(res, discovered_surfaces=_disc, roles=_roles)
+            # RELEVANCE DENOMINATOR: the coverage denominator is the RELEVANT classes the planner selected for
+            # THIS target out of the MITRE-ATT&CK-enriched techniques DB -- its seeds are already applies_to/
+            # stack-filtered -- mapped into the coverage taxonomy via class_of, NOT a fixed parity list. So
+            # classes_not_reached then means a RELEVANT MITRE technique we never tested (a real gap on this
+            # target), not noise from classes that never applied here. Falls back to parity if there are no seeds.
+            _exp = None
+            try:
+                import coverage as _covtax
+                _exp = sorted({_covtax.class_of(s) for s in (seeds or [])} - {"recon", ""})
+            except Exception:
+                _exp = None
+            _a = assurance.assess(res, discovered_surfaces=_disc, roles=_roles,
+                                  expected_classes=(_exp or None))
+            _a["denominator"] = "relevant" if _exp else "parity"
+            _a["expected_classes_relevant"] = _exp or []
             res["assurance"] = _a
             # TELEMETRY (board ask): every run emits coverage% + FP-rate so assurance numbers accrue over
             # runs. FP proxy = lead->confirmed conversion (candidates that became verified findings).
@@ -893,12 +968,53 @@ def run_hunt(objective, role="owner", budget=40, store_path=None, base=BASE,
                 res["telemetry"] = tele
             except Exception:
                 pass
-            print("[assurance] verdict=%s class=%s saturation=%s findings=%d conv=%s"
-                  % (_a.get("verdict"), _a.get("class_completeness"), _a.get("surface_saturation"),
+            # COVERAGE-DRIVEN GAP HUNTING (focused, not cannon-fire): turn the RELEVANT untested surfaces +
+            # classes into frontier directions/hints so the machine actually GOES and proves-or-rules-out a
+            # weakness there next round / next run (same base => same frontier run_id), instead of only
+            # reporting the gap. Relevant-only + bounded. Gate AEGIS_COVERAGE_FEEDBACK=0.
+            if str(os.environ.get("AEGIS_COVERAGE_FEEDBACK", "1")).lower() not in ("0", "false", "no", "off"):
+                try:
+                    import frontier as _frc
+                    _gap_s = (_a.get("surfaces_not_reached") or [])[:8]
+                    _gap_c = (_a.get("classes_not_reached") or [])[:8]
+                    for _s in _gap_s:
+                        _frc.add_intent(f"{base}", f"coverage gap: probe the RELEVANT untested surface {_s} "
+                                        "(prove or rule out a weakness there)", surface=_s, origin="coverage")
+                    if _gap_c:
+                        _frc.add_hint(f"{base}", "COVERAGE GAPS -- relevant classes never reached: "
+                                      + ", ".join(_gap_c) + " -- target these with a fitting probe.",
+                                      origin="coverage")
+                    if _gap_s or _gap_c:
+                        print(f"[coverage] relevant gaps -> frontier: {len(_gap_s)} surface(s), "
+                              f"{len(_gap_c)} class(es){': ' + ', '.join(_gap_c) if _gap_c else ''}", flush=True)
+                except Exception:
+                    pass
+            print("[assurance] denom=%s class=%s saturation=%s findings=%d conv=%s"
+                  % (_a.get("denominator"), _a.get("class_completeness"), _a.get("surface_saturation"),
                      _a.get("verified_findings", 0), (res.get("telemetry") or {}).get("lead_to_confirmed")),
                   flush=True)  # stdout: run_recall.sh & downstream parsers capture the [assurance] line here
         except Exception as _ae:
             res["assurance"] = {"error": str(_ae)[:160]}
+    # INDEPENDENT RE-VERIFICATION (ARTEX retester port, was shelf-ware): a second, adversarial pass
+    # re-dispatches each verified finding's move from a FRESH context -> reproduced / fixed / inconclusive
+    # (unreachable/WAF/error => inconclusive, never 'fixed'). Hardens validation -- the research's #1
+    # AI-pentest gap is over-claimed / hallucinated findings; we already oracle-gate, this re-confirms
+    # independently. ANNOTATION ONLY: it never mutates the hash-chained verdict, it attaches res["retest"].
+    # Gate AEGIS_RETEST=0; the optional LLM argue-opposite layer stays behind AEGIS_RETEST_LLM.
+    if str(os.environ.get("AEGIS_RETEST", "1")).lower() not in ("0", "false", "no", "off"):
+        try:
+            import retester as _rt
+            _rctx = {"base": base, "session_for_role": session_for_role}
+            _rr = [_rt.retest(f, store_path=store_path, ctx=_rctx) for f in store.verified()]
+            res["retest"] = _rr
+            _rep = sum(1 for r in _rr if r.get("verdict") == "reproduced")
+            _inc = sum(1 for r in _rr if r.get("verdict") == "inconclusive")
+            _fix = sum(1 for r in _rr if r.get("verdict") == "fixed")
+            print(f"[retest] reproduced={_rep} inconclusive={_inc} fixed={_fix} of {len(_rr)} verified",
+                  flush=True)
+        except Exception as _re2:
+            res["retest"] = {"error": str(_re2)[:160]}
+
     # RELAY handoff + ANTI-LAZINESS: append this level's CONFIRMED footholds for the next level and flag a
     # level that added NO new confirmed depth (dead-end / lazy).
     if campaign:

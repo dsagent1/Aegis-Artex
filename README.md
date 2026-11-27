@@ -101,6 +101,13 @@ open-source offensive tooling.
   **adversarial retester** (reproduced/fixed/inconclusive), **`ask_operator`** human-unblock, an open
   **intent/hint frontier** with a hard-floor (never idle), **self-extending tooling** (forge a tool at
   runtime), **cold-digest** long-run memory, and a live **execution monitor** (`hunt_monitor.py`).
+- **Grounded exploit development, coverage & self-training** ([docs/GROUNDED_EXPLOIT_DEVELOPMENT.md](docs/GROUNDED_EXPLOIT_DEVELOPMENT.md))
+  — a known gap is developed, not guessed: the **n-day developer** diffs the patched vs vulnerable release
+  (+ **live advisory research**) to build a targeted probe, grounded in the real fix; **CVE-clumpiness**
+  spends budget on the densest components first; the **novel lane** reasons out a probe from a 0-day
+  methodology; both lanes **self-train** from oracle-confirmed wins (few-shot), measured by a confirmable
+  **reproduction benchmark**. Plus a first-class **JWT** vector, an adversarial **retester**, and a
+  **relevant** (MITRE-enriched) coverage-denominator whose gaps feed the frontier to hunt.
 - Runtime safety: **noise governor** (per-host pacing + 429/503 backoff), **untrusted-output nonce
   boundary**, signed **scope/authorization** gates (fail-closed).
 

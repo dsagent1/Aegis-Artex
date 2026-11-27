@@ -49,7 +49,7 @@ def _direction(move) -> str:
 
 # WHO WRITES THE PROBE (CO-LEAD WRITERS: ds + kimi):
 #   * CO-LEADS = deepseek-v4-pro ("ds") + kimi-k2.7-code -- the two writers PROVEN to emit runnable,
-#     oracle-confirmed exploit code. ds = the board brain + the target-MED / SSRF-chain driver; kimi =
+#     oracle-confirmed exploit code. ds = the board brain + the fixflow-MED / SSRF-chain driver; kimi =
 #     the coder-bakeoff winner (the only CF coder that RELIABLY weaponized the twins; all others ~0).
 #     CF Workers-AI is on the PAID plan, so kimi is now reachable in-loop -- it just needs >=1500-2000
 #     tokens (the reasoning-model empty-output gotcha), which make_code_writer's default budget now gives.
@@ -60,8 +60,8 @@ def _direction(move) -> str:
 #     novel-code move, qwq-32b analyst picks the best, preferring agreement -- the DS<->KIMI convergence-
 #     trust signal. ~2x writer cost on novel-code moves only; single-writer fallback path stays available.
 PRIMARY_WRITER = "ds"
-FALLBACK_ORDER = ["ds", "qwen2.5-coder-32b", "llama-4-scout", "llama-3.3-70b", "deepseek-cf"]  # kimi retired on CF 2026-11-20
-ENSEMBLE_MODELS = ["ds", "qwen2.5-coder-32b"]
+FALLBACK_ORDER = ["ds", "kimi-k2.7-code", "qwen2.5-coder-32b", "llama-4-scout", "llama-3.3-70b"]
+ENSEMBLE_MODELS = ["ds", "kimi-k2.7-code"]
 
 
 def _fallback_order():
@@ -109,6 +109,24 @@ def _brief(move, context) -> str:
         parts.append(f"EXPECTED OBSERVABLE: {move['expected_oracle']}.")
     if stack:
         parts.append("TARGET STACK: " + json.dumps(stack)[:400] + ".")
+    # TRAINING GROUNDING (worked-before exemplars so the coders generalise instead of starting cold):
+    # a KNOWN-gap situation (patch-diff / n-day / known component+version) draws on confirmed diff->probe
+    # wins; a NOVEL (0-day) situation draws on the 0-day METHODOLOGY + confirmed novel wins.
+    try:
+        _vc = str(move.get("vuln_class") or "")
+        _known = (str(move.get("technique") or "").startswith("patch_diff")
+                  or _vc.lower() in ("n-day", "known-cve", "known-case")
+                  or (move.get("component") and move.get("version")))
+        if _known:
+            import diff_lessons as _dl
+            _ground = _dl.brief(vuln_class=_vc, component=str(move.get("component") or ""))
+        else:
+            import novel_methodology as _nm
+            _ground = _nm.brief(vuln_class=_vc, direction=layer)
+        if _ground:
+            parts.append(_ground)
+    except Exception:
+        pass
     parts.append(
         "Emit EXACTLY ONE runnable suggestion in TARGET / CODE / ORACLE form. CODE = a single curl "
         "command against the mirror base URL, OR a short self-contained python3 snippet. ORACLE = an "

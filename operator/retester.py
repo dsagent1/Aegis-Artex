@@ -46,15 +46,31 @@ def _load_findings(store_path=None):
     return out
 
 
+_ACTION_ALIAS = {                                   # claim_type last-segment -> real LEGS action (fallback only)
+    "jwt_forgery": "jwt", "object_level_authz": "idor", "auth_state": "stateful",
+    "resource_persistence": "stateful", "mass_assignment": "massassign",
+}
+
+
 def _move_from_finding(f):
-    """Reconstruct the probe move from a finding so vectors can re-run it."""
+    """Reconstruct the probe move so vectors can re-run it EXACTLY. Prefer the move stashed on the finding's
+    provenance at record time (faithful re-dispatch); fall back to a claim_type heuristic (+ action alias) only
+    when no stashed move exists -- and flag it so a mis-reconstructable finding is retested as inconclusive,
+    never a misleading 'fixed'."""
+    prov = f.get("provenance") or {}
+    mv = prov.get("move") if isinstance(prov, dict) else None
+    if isinstance(mv, dict) and mv.get("action"):
+        return dict(mv, _retest_of=f.get("finding_id"), _faithful=True)
     ev = (f.get("evidence") or [{}])
     detail = ev[0].get("detail", "") if ev and isinstance(ev[0], dict) else ""
+    ct = f.get("claim_type") or ""
+    last = ct.split(".")[-1] if "." in ct else "web"
+    action = _ACTION_ALIAS.get(last, last if last else "web")
     return {
-        "action": f.get("claim_type", "web").split(".")[-1] if "." in (f.get("claim_type") or "") else "web",
+        "action": action,
         "surface": f.get("surface") or f.get("endpoint") or "/",
         "param": f.get("param"), "role": f.get("role", "owner"),
-        "_retest_of": f.get("finding_id"), "_orig_detail": str(detail)[:400],
+        "_retest_of": f.get("finding_id"), "_orig_detail": str(detail)[:400], "_faithful": False,
     }
 
 
@@ -94,22 +110,28 @@ def _argue_opposite(f, res):
         return ""
 
 
-def retest(f, store_path=None):
-    """Retest one finding dict. Returns {finding_id, verdict, reachable, note}."""
-    base = os.environ.get("AEGIS_TARGET") or f.get("base") or ""
-    ctx = {"base": base}
-    try:
-        import session_factory
-        ctx["session_for_role"] = session_factory.from_env(base)
-    except Exception:
-        pass
+def retest(f, store_path=None, ctx=None):
+    """Retest one finding dict. Returns {finding_id, verdict, reachable, note}. `ctx` (optional) is the LIVE
+    hunt context (base + session_for_role) so the re-dispatch hits the SAME resolved origin/session; when not
+    given it is rebuilt from the environment (back-compat)."""
+    if ctx is None:
+        base = os.environ.get("AEGIS_TARGET") or f.get("base") or ""
+        ctx = {"base": base}
+        try:
+            import session_factory
+            ctx["session_for_role"] = session_factory.from_env(base)
+        except Exception:
+            pass
     verified, reachable, res = _reoracle(f, ctx)
+    faithful = bool(_move_from_finding(f).get("_faithful"))
     if not reachable:
         verdict = "inconclusive"                         # unreachable/WAF/error -> NEVER 'fixed'
     elif verified:
         verdict = "reproduced"
+    elif not faithful:
+        verdict = "inconclusive"                         # reachable but no faithful re-dispatch -> not provably fixed
     else:
-        verdict = "fixed"                                # reachable + oracle now rejects
+        verdict = "fixed"                                # reachable + the EXACT probe now rejects
     note = _argue_opposite(f, res)
     # the adversarial layer can downgrade an over-confident verdict to inconclusive
     if note and "inconclusive" in note.lower() and verdict == "fixed":

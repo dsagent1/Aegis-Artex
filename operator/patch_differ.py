@@ -26,6 +26,9 @@ COMPONENT_REPOS = {
     "gitlab": "gitlabhq/gitlabhq",
     "nextcloud": "nextcloud/server",
     "grafana": "grafana/grafana",
+    "elementor": "elementor/elementor",                       # major WP plugin, public on GitHub (diffable)
+    "akismet": "Automattic/akismet",
+    "jetpack": "Automattic/jetpack",
 }
 
 # hunk lines that touch a security-relevant surface (the patch usually tightens one of these)

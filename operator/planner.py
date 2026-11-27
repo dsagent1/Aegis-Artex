@@ -391,6 +391,12 @@ class Planner:
             for k, v in self._RECON_BODY.items():
                 if k in body:
                     found.update(v)
+            # JWT/token-auth relevance signal (data-driven): a JWT in the body, a token field, or a
+            # Bearer challenge -> flags the stack so jwt_seeds proposes the forgery probe ON-TARGET only.
+            if "eyj" in body or '"token"' in body or '"access_token"' in body or '"accesstoken"' in body or '"id_token"' in body:
+                found.update(["jwt", "token"])
+            if "bearer" in ((r.headers.get("WWW-Authenticate") or "") + (r.headers.get("Authorization") or "")).lower():
+                found.update(["jwt", "token"])
         return sorted(found)
 
     def fingerprint(self, target: str, surfaces=None, roles=None, stack=None,
@@ -788,6 +794,37 @@ class Planner:
                         "why_novel": f"IDOR/BOLA: sweep {c} object ids across roles (object-level authz)."})
         return out
 
+    def jwt_seeds(self, base, roles=None, fp=None, objective="") -> list:
+        """Seed a JWT signature-bypass probe ONLY when the target is RELEVANT -- its fingerprint signals
+        token/JWT auth (stack carries jwt/token, or a JSON/REST API that exposes an auth surface). The jwt
+        leg itself self-gates to n/a when no JWT is actually issued, so this never cannon-fires; the relevance
+        filter just avoids PROPOSING it on plainly-irrelevant targets (the owner's 'relevancy, not firing
+        cannons' rule). Protected routes to prove a forged token against come from the fingerprint's admin-ish
+        surfaces + AEGIS_JWT_ADMIN_ROUTES. Gate AEGIS_JWT_SEED=0. Offline-safe."""
+        if str(os.environ.get("AEGIS_JWT_SEED", "1")).lower() in ("0", "false", "no", "off"):
+            return []
+        import re as _re
+        fp = fp or {}
+        stack = " ".join(str(s).lower() for s in (fp.get("stack") or []))
+        surfaces = [str(s) for s in (fp.get("surfaces") or [])]
+        jwt_relevant = ("jwt" in stack or "token" in stack
+                        or (("api" in stack or "json" in stack)
+                            and any(_re.search(r"login|signin|auth|oauth|session|token", s or "", _re.I) for s in surfaces)))
+        if not jwt_relevant:
+            return []                                           # not a token/JWT target -> do not propose it
+        admin = [s for s in surfaces if _re.search(r"admin|manage|config|internal|dashboard|users?$", s or "", _re.I)]
+        env_routes = [r.strip() for r in os.environ.get("AEGIS_JWT_ADMIN_ROUTES", "").split(",") if r.strip()]
+        routes = list(dict.fromkeys(env_routes + admin)) or ["/rest/admin/application-configuration", "/api/admin", "/admin"]
+        role = (roles or ["owner"])[0]
+        cap = int(os.environ.get("AEGIS_JWT_SEED_CAP", "3"))
+        out = []
+        for rt in routes[:cap]:
+            out.append({"action": "jwt", "surface": rt, "verify_path": rt, "role": role,
+                        "vuln_class": "broken-authentication", "technique": "authn.jwt", "layer": "code",
+                        "severity": "high", "seed": "planner",
+                        "why_novel": f"JWT forgery (alg:none / RS256->HS256) -> {rt} with forged admin claims."})
+        return out
+
     def rate_seeds(self, base, roles=None, fp=None, objective="") -> list:
         """COMMERCIAL-PARITY: seed a bounded, non-destructive RATE-LIMIT probe for auth-SENSITIVE
         surfaces (login/reset/OTP) discovered in the fingerprint (+ AEGIS_RATE_SURFACES). Gate:
@@ -1013,6 +1050,7 @@ class Planner:
         st_seeds = self.stateful_seeds(base or target, roles=roles, fp=fp, objective=objective)
         sy_seeds = self.synth_seeds(base or target, roles=roles, fp=fp, objective=objective)
         id_seeds = self.idor_seeds(base or target, roles=roles, fp=fp, objective=objective)
+        jw_seeds = self.jwt_seeds(base or target, roles=roles, fp=fp, objective=objective)   # broken-auth JWT (relevancy-gated)
         rt_seeds = self.rate_seeds(base or target, roles=roles, fp=fp, objective=objective)
         # one passive cookie/security-header probe per run (commercial-parity); gate AEGIS_SECHEADERS_SEED=0
         sh_seeds = ([] if str(os.environ.get('AEGIS_SECHEADERS_SEED','1')).lower() in ('0','false','no','off')
@@ -1106,7 +1144,7 @@ class Planner:
             # seeds ORDERED BY OBJECTIVE-VALUE (auth-bypass/SQLi/IDOR/XSS lead) so a small budget starts with
             # the moves most likely to achieve the goal instead of sweeping low-value classes. Gate AEGIS_RANK_SEEDS=0.
             _attack = (_copy.deepcopy(zap_seed) + _copy.deepcopy(sc_seeds) + _copy.deepcopy(bo_seeds) + _copy.deepcopy(bg_seeds) + _copy.deepcopy(fd_seeds) + _copy.deepcopy(in_seeds) + _copy.deepcopy(st_seeds) + _copy.deepcopy(sy_seeds)
-                       + _copy.deepcopy(id_seeds) + _copy.deepcopy(rt_seeds) + _copy.deepcopy(sh_seeds)
+                       + _copy.deepcopy(id_seeds) + _copy.deepcopy(jw_seeds) + _copy.deepcopy(rt_seeds) + _copy.deepcopy(sh_seeds)
                        + _copy.deepcopy(sfx_seeds) + _copy.deepcopy(or_seeds) + _copy.deepcopy(ma_seeds)
                        + _copy.deepcopy(cs_seeds) + _copy.deepcopy(ss_seeds) + _copy.deepcopy(xss_seeds)
                        + _copy.deepcopy(up_seeds) + _copy.deepcopy(sqli_seeds) + _copy.deepcopy(nuclei_seed))

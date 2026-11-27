@@ -22,6 +22,7 @@ _ACTION_CLASS = {
     "csrf": "csrf", "ssrf": "ssrf", "xss": "xss", "file_upload": "file_upload",
     "supply_chain": "supply_chain", "stateful": "business_logic", "differential": "differential",
     "recon": "recon", "misconfig": "security_headers", "fuzz": "injection", "ossfuzz": "injection",
+    "jwt": "auth_session", "jwt_forge": "auth_session", "broken_auth_jwt": "auth_session",
 }
 # vuln-class keyword -> parity class (fallback when the action is generic 'web').
 _KEYWORD_CLASS = [

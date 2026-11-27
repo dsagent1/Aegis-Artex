@@ -41,6 +41,24 @@ def build_live(objective, role, budget, base, store_path, max_seeds=None, max_an
     board brainstorm never fires (board_rounds=0) -- so per_agent_brainstorm has no effect."""
     store = FindingStore(store_path)
 
+    # AUTONOMOUS reachability (same self-driving as run_hunt, so the MULTI-AGENT path reaches the real target
+    # with NO manual env): (1) proxy_guard routes egress through the VPN'd WSL proxy if the owner opted in;
+    # (2) origin_resolver detects a WAF'd front door, finds the leaked origin, confirms the real app via
+    # Host:, sets AEGIS_HOST_HEADER and rebinds `base` to the origin. Fail-open.
+    try:
+        import proxy_guard
+        proxy_guard.ensure(base)
+    except Exception:
+        pass
+    try:
+        import origin_resolver
+        _ores = origin_resolver.resolve(base)
+        if _ores.get("origin_ip"):
+            print(f"[origin] {_ores['reason']}", flush=True)
+            base = _ores["base"]
+    except Exception:
+        pass
+
     # AUTH + PER-LEG-AWARE SESSION MODEL (F2 fix). Two observed failure modes, neither fixable by a flat default:
     #   (a) per-worker THREAD-LOCAL isolation silently DROPS the sql_raw auth-bypass leg -- that leg builds its
     #       own sub-sessions and errors "'NoneType' object is not callable" under the wrapper -> a false NEGATIVE

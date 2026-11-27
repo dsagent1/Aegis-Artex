@@ -255,6 +255,7 @@ class HuntState:
     since_board: int = 0                               # real attempts since the last board round (interleave cadence)
     escalate_budget: int = 0
     stop_reason: str = ""
+    floor_used: int = 0                                # frontier hard-floor seedings used (bounded, so a truly saturated board still terminates)
     angle_counts: dict = field(default_factory=dict)   # approach-family -> executions (drives spread)
     seen_signals: set = field(default_factory=set)     # (combo,status,body-bucket) -> repeat = noise
     combo_counts: dict = field(default_factory=dict)   # coarse combo -> executions (angle accounting)
@@ -742,7 +743,16 @@ class IterativeHunt:
         dir_counts = {d: st.direction_counts.get(d, 0) for d in _LAYERS}
         nc_left = {d: max(0, self.max_novel_code - st.novel_code_counts.get(d, 0)) for d in _LAYERS}
         how_far = list(getattr(_reach, "HOW_FAR_QUESTIONS", ()))
-        return {"target": target, "objective": objective, "phase": st.phase,
+        # FRONTIER (#5): open fact-anchored directions + fresh hints + the discipline/hard-floor rule, so the
+        # board builds on confirmed facts (a synthesis no menu holds) instead of only re-ranking techniques.
+        fblock = ""
+        try:
+            if str(os.environ.get("AEGIS_FRONTIER", "1")).lower() not in ("0", "false", "no", "off"):
+                import frontier as _fr
+                fblock = _fr.planner_block(f"{target}")
+        except Exception:
+            fblock = ""
+        return {"target": target, "objective": objective, "phase": st.phase, "frontier": fblock,
                 "planner_intel": pintel,      # OBSERVATORY: factual ranked techniques (not moves) -- novelty is yours
                 "real_attempts_done": st.real_attempts, "real_attempts_target": self.budget,
                 "budget_remaining": st.budget, "noise_so_far": st.noise, "confirmed": st.confirmed,
@@ -918,6 +928,32 @@ class IterativeHunt:
                             continue
                     if self._try_reopen(st, target, objective, "board_saturation"):
                         continue
+                    # FRONTIER HARD FLOOR (#5): the board ran out of menu ideas, but if budget remains and we
+                    # have CONFIRMED facts to synthesize from, don't idle -- seed one fact-anchored direction +
+                    # hint and force one more board round. Bounded by AEGIS_FRONTIER_FLOOR_MAX so a genuinely
+                    # saturated board (or no facts to anchor on) still terminates.
+                    try:
+                        # Trigger ON the saturation condition itself: the board already produced nothing
+                        # (that IS the idle the floor must break), so don't re-gate on frontier.hard_floor's
+                        # open-intents test -- just require budget + confirmed facts to anchor on, bounded.
+                        if (str(os.environ.get("AEGIS_FRONTIER", "1")).lower() not in ("0", "false", "no", "off")
+                                and st.budget > 0 and st.confirmed
+                                and st.floor_used < int(os.environ.get("AEGIS_FRONTIER_FLOOR_MAX", "2"))):
+                            import frontier as _fr
+                            st.floor_used += 1
+                            _last = st.confirmed[-1]["move"]
+                            _fr.add_intent(f"{target}", "synthesize a NEW fact-anchored direction by "
+                                           "chaining/escalating the confirmed findings; do NOT repeat tried "
+                                           "signatures or restate the goal", angle=_last.get("angle", ""),
+                                           surface=_last.get("surface", ""),
+                                           vuln_class=str(_last.get("vuln_class", "")), origin="hard_floor")
+                            _fr.add_hint(f"{target}", "HARD FLOOR: board saturated but budget remains and the "
+                                         "goal is unmet -- propose a fact-anchored chain/escalation of a "
+                                         "CONFIRMED finding, not a menu repeat.", origin="hard_floor")
+                            st.since_board = self.board_cadence   # force a board round next iteration
+                            continue
+                    except Exception:
+                        pass
                     st.stop_reason = "board_saturation"; break
                 st.queue = cands
             move = self._pick(st)
@@ -1046,6 +1082,19 @@ class IterativeHunt:
 
             if verdict == "verified":
                 st.confirmed.append({"move": move, "phase": st.phase})
+                # FRONTIER (#5): a confirmed fact opens a new exploration direction (chain/escalate it) that
+                # the board reads next round -- the frontier grows from ground truth, not the menu.
+                try:
+                    if str(os.environ.get("AEGIS_FRONTIER", "1")).lower() not in ("0", "false", "no", "off"):
+                        import frontier as _fr
+                        _vc = move.get("vuln_class") or move.get("technique") or move.get("action") or "finding"
+                        _sf = move.get("surface") or move.get("path") or ""
+                        _fr.add_intent(f"{target}", f"chain/escalate the CONFIRMED {_vc} at {_sf} "
+                                       "(reuse this foothold toward deeper access; do not restate the goal)",
+                                       angle=move.get("angle", ""), surface=_sf, vuln_class=str(_vc),
+                                       origin="finding")
+                except Exception:
+                    pass
                 st.dir_confirms[_dir] = st.dir_confirms.get(_dir, 0) + 1   # yield-weighted direction split
                 st.combo_foothold.add(combo)
                 st.no_progress = 0
@@ -1241,7 +1290,11 @@ def board_brainstorm(context: dict) -> list:
             '"needs_code":false,"tool":"kali-tool-or-empty","new_code":"brief of the contained probe to WRITE '
             'if no tool fits","why_novel":".."}. '
             + (reach_doctrine + " " if reach_doctrine else "")
-            + "RAW MATERIAL FOR NOVELTY -- use it, do not just label: (a) `planner_intel.attack_toolset` is "
+            + "FRONTIER: the `frontier` field carries OPEN DIRECTIONS (fact-anchored exploration threads) + "
+              "fresh HINTS + a HARD-FLOOR rule. Advance the open directions and obey any hint; if it says the "
+              "goal is unmet with no open direction, you MUST emit at least one NEW, fact-anchored move (a "
+              "synthesis of confirmed observations -- chain/escalate a verified finding), never idle or repeat. "
+            + "RAW MATERIAL FOR NOVELTY -- use it, do not just label:(a) `planner_intel.attack_toolset` is "
             "MITRE ATT&CK / technique-DB entries (each with `tools`, `how_to_test`, `mitre_tactics`) already "
             "pulled from the RAG and ranked for THIS target -- COMBINE and CHAIN them (mix techniques, chain "
             "tactics, compose/adapt their tools) into novel approaches; (b) prefer tools in "

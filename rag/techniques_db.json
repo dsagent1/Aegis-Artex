@@ -302,13 +302,16 @@
       "kali_tools": [
         "jwt_tool"
       ],
-      "new_code": [],
+      "new_code": [
+        "vectors.jwt_leg (action:jwt) -- alg:none + RS256->HS256 forgery, oracle-verified"
+      ],
       "how_to_test": "test alg=none, key-confusion (RS->HS), weak secret crack, kid injection, expiry/replay",
       "oracle": "forged/altered token accepted by the server",
       "applies_to": [
         "JWT auth"
       ],
-      "real_world_basis": "forged admin JWT via stolen signing key"
+      "real_world_basis": "forged admin JWT via stolen signing key",
+      "action": "jwt"
     },
     {
       "id": "authn.oauth",
