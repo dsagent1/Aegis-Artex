@@ -133,11 +133,24 @@ def resolve(target: str) -> dict:
     if not m:
         return res
     scheme, domain = m.group(1), m.group(2)
+    _hh = os.environ.get("AEGIS_HOST_HEADER") or None          # an IP target needs the vhost Host header
     # 1. front door
-    st, hd, body = _fetch(target)
+    st, hd, body = _fetch(target, host_header=_hh)
     if not _waf_blocked(st, hd, body) and _looks_like_app(st, body):
         res["reason"] = f"front door serves a real app ({st})"
         return res
+    # 1b. SCHEME FALLBACK (autonomous): the configured scheme did NOT CONNECT (st==0: SSL handshake / TCP
+    # failure -- e.g. HTTPS:443 dropped) but the OTHER scheme on the SAME host serves the real app. Switch
+    # scheme on our own instead of staying on a dead base -- reachability is the machinery's job.
+    if st == 0:
+        alt = "http" if scheme == "https" else "https"
+        alt_target = re.sub(r"^https?://", alt + "://", target, count=1)
+        sta, hda, bodya = _fetch(alt_target, host_header=_hh)
+        if sta and _looks_like_app(sta, bodya) and not _waf_blocked(sta, hda, bodya):
+            res.update({"base": alt_target,
+                        "reason": f"{scheme} front door unreachable (connect/SSL fail); {alt} serves the "
+                                  f"real app ({sta}) -- switched scheme autonomously"})
+            return res
     # 2. origin candidates
     cand_hosts = {f"{s}.{domain}" for s in _LEAKY_SUBS} | {domain, f"www.{domain}"}
     cand_hosts |= {h for h in _ct_subdomains(domain)}
