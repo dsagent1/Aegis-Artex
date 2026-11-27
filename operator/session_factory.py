@@ -62,7 +62,7 @@ def from_env(base):
     except Exception:
         role_map = {}
     # AEGIS_HOST_HEADER: force a Host header on every request. Lets the hunt reach an origin that vhosts
-    # on Host (hit the origin IP directly with Host: chikov.com to bypass a CF WAF / wrong default vhost),
+    # on Host (hit the origin IP directly with Host: target.example to bypass a CF WAF / wrong default vhost),
     # so surface discovery reads the REAL app instead of a 403/other-vhost -> no more phantom surfaces.
     host_hdr = (os.environ.get("AEGIS_HOST_HEADER") or "").strip() or None
     if not isinstance(role_map, dict) or not role_map:

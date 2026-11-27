@@ -176,4 +176,4 @@ def resolve(target: str) -> dict:
 
 if __name__ == "__main__":
     import sys, json
-    print(json.dumps(resolve(sys.argv[1] if len(sys.argv) > 1 else "https://chikov.com"), indent=2))
+    print(json.dumps(resolve(sys.argv[1] if len(sys.argv) > 1 else "https://example.com"), indent=2))

@@ -128,11 +128,14 @@ def _brief(move, context) -> str:
     except Exception:
         pass
     parts.append(
-        "Emit EXACTLY ONE runnable suggestion in TARGET / CODE / ORACLE form. CODE = a single curl "
-        "command against the mirror base URL, OR a short self-contained python3 snippet. ORACLE = an "
-        "INDEPENDENT observable that PROVES the foothold/bridge (an HTTP status/body assertion, or a "
-        "SQL SELECT returning proof) -- NOT a self-printed 'SUCCESS'. STRICTLY NON-DESTRUCTIVE: "
-        "plant/read for proof, NEVER erase/drop/delete/truncate.")
+        "Emit EXACTLY ONE runnable suggestion in three SEPARATE labelled blocks -- TARGET:, then CODE:, then "
+        "ORACLE: -- and do NOT merge the oracle into the code. CODE = a single curl command against the base "
+        "URL, OR a short self-contained python3 snippet, with NOTHING after it. ORACLE = ONE line: a status "
+        "code and/or a PLAIN substring that appears in a SUCCESS response -- a bare word, NO backticks, NO "
+        "dotted paths (write `token`, not `authentication.token`), e.g. 'ORACLE: status 200 and body contains "
+        "token'. It must be an INDEPENDENT observable that PROVES the foothold/bridge (not a self-printed "
+        "'SUCCESS'), or a SQL SELECT returning proof. STRICTLY NON-DESTRUCTIVE: plant/read for proof, NEVER "
+        "erase/drop/delete/truncate.")
     return "\n".join(parts)
 
 

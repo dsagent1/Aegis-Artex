@@ -111,5 +111,5 @@ def leads(base, host_header=None):
 
 if __name__ == "__main__":
     import sys
-    b = sys.argv[1] if len(sys.argv) > 1 else "https://194.163.155.111"
-    print(json.dumps(leads(b, os.environ.get("AEGIS_HOST_HEADER", "chikov.com")), indent=2)[:2500])
+    b = sys.argv[1] if len(sys.argv) > 1 else "https://example.com"
+    print(json.dumps(leads(b, os.environ.get("AEGIS_HOST_HEADER", "example.com")), indent=2)[:2500])

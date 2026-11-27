@@ -46,8 +46,8 @@ ACCOUNTS = {"owner": "owner-user", "dispatcher": "dispatcher-user", "finance": "
             "warehouse": "warehouse-user", "technician": "technician-user"}
 # Point at the REAL mirror accounts without hardcoding client values (skill doctrine: env, not code).
 # AEGIS_ROLE_MAP (JSON role->login-name) overlays the generic defaults; AEGIS_TEST_PIN sets the shared PIN.
-# e.g. AEGIS_ROLE_MAP={"owner":"Owner User","finance":"Finance User","dispatcher":"Dispatcher One",
-#      "warehouse":"Warehouse User","technician":"Technician One"}  AEGIS_TEST_PIN=123456
+# e.g. AEGIS_ROLE_MAP={"owner":"Alex Morgan","finance":"Fiona Clarke","dispatcher":"Marcus Reilly",
+#      "warehouse":"Wes Okonkwo","technician":"Jordan Blake"}  AEGIS_TEST_PIN=123456
 try:
     _rm = json.loads(os.environ.get("AEGIS_ROLE_MAP", "") or "{}")
     ACCOUNTS.update({k.lower(): v for k, v in _rm.items() if v})
@@ -337,17 +337,23 @@ def check_oracle(oracle: str, resp, sess):
             m_bare = re.search(r"\b([1-5]\d\d)\b", low)
             if m_bare:
                 exp = int(m_bare.group(1)); verdict = "pass" if st == exp else "fail"; notes.append(f"expect ~{exp}")
-        # body-contains, quoted OR bare (contains 'x' | contains "x" | contains x)
-        bm = re.search(r"contains?\s+['\"]([^'\"]+)['\"]", o, re.I) or re.search(r"contains?\s+([^\s'\";,.]+)", o, re.I)
+        # body-contains, quoted (incl BACKTICKS) OR bare (contains 'x' | contains "x" | contains `x` | contains x)
+        bm = (re.search(r"contains?\s+[`'\"]([^`'\"]+)[`'\"]", o, re.I)
+              or re.search(r"contains?\s+([^\s'\"`;,]+)", o, re.I))
         if bm:
-            hit = bm.group(1) in (resp.text or "")
+            # strip wrapping backticks/quotes; a DOTTED JSON path (authentication.token) never appears
+            # literally in JSON ("authentication":{"token"), so check that EACH segment is present instead.
+            marker = bm.group(1).strip().strip("`'\"")
+            body_t = resp.text or ""
+            segs = [s for s in re.split(r"[.\[\]]+", marker) if s]
+            hit = (all(s in body_t for s in segs) if len(segs) > 1 else (marker in body_t))
             if verdict == "manual":
                 verdict = "pass" if hit else "fail"
             elif verdict == "pass" and not hit:
                 # a REQUIRED body signal was specified but ABSENT -> the proof fails even on a 2xx,
                 # so a bare-200 / SPA-shell response can't satisfy a "200 AND body contains X" oracle.
                 verdict = "fail"
-            notes.append(f"body~'{bm.group(1)}':{hit}")
+            notes.append(f"body~'{marker}':{hit}")
     db_confirmed = False   # A2: did an authoritative DB SELECT witness decide this? (independent 2nd oracle)
     sel = re.search(r"(SELECT\b.+?;)", o, re.I | re.S)
     if sel:

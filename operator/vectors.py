@@ -1898,7 +1898,7 @@ def _discover_login(base, with_conf=False):
         return (best, best_score) if with_conf else best
     cands = [c.strip() for c in os.environ.get("AEGIS_LOGIN_CANDIDATES", "").split(",") if c.strip()] or [
         # CMS login surfaces FIRST -- without these a WordPress/Joomla/Drupal target was mis-detected and
-        # every auth attack went at a generic SPA path (chikov is WordPress: real login is /wp-login.php,
+        # every auth attack went at a generic SPA path (a WordPress target: real login is /wp-login.php,
         # not /rest/user/login). wp-login.php answers a bad POST with 200+form (score 2) so it's picked.
         "/wp-login.php", "/xmlrpc.php", "/administrator/index.php", "/admin/login", "/wp-json/wp/v2/users",
         "/rest/user/login", "/api/auth/login", "/api/login", "/api/users/login", "/api/v1/auth/login",
