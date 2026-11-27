@@ -89,6 +89,18 @@ open-source offensive tooling.
   Structure the objective as a **result across a surface/roles**, not one payload — e.g.
   `find and verify access-control vulnerabilities across the mirror and its roles` — because the frontier
   plans its own angles; for one specific check use a direct `run_tool`/`run_command` probe instead.
+- **Autonomous reachability + grounded discovery** ([docs/AUTONOMOUS_REACHABILITY.md](docs/AUTONOMOUS_REACHABILITY.md))
+  — the hunt self-diagnoses a WAF'd/IP-banned target: finds the leaked **origin** behind a CDN, routes
+  egress through the owner's VPN, rotates country on a ban, and sends the right `Host:` — reaching the
+  *real* app with no manual config (single-pass **and** multi-agent paths). It then **stays on the real
+  surface**: a **reality gate** skips soft-404 phantom endpoints, **WordPress plugin-version harvest**
+  turns version-obfuscation's leak into CVE leads, **shared-host / reverse-IP** + **credential-exposure**
+  routes are first-class in the Planner, and a **patch-diff n-day ladder** (+ content-authenticity /
+  TLS fingerprint-trust gate) defeats spoofed version headers.
+- **ARTEX-ported disciplines** — **role-specialized prompts** with executor finding-quality gates, an
+  **adversarial retester** (reproduced/fixed/inconclusive), **`ask_operator`** human-unblock, an open
+  **intent/hint frontier** with a hard-floor (never idle), **self-extending tooling** (forge a tool at
+  runtime), **cold-digest** long-run memory, and a live **execution monitor** (`hunt_monitor.py`).
 - Runtime safety: **noise governor** (per-host pacing + 429/503 backoff), **untrusted-output nonce
   boundary**, signed **scope/authorization** gates (fail-closed).
 
