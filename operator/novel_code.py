@@ -133,9 +133,11 @@ def _brief(move, context) -> str:
         "URL, OR a short self-contained python3 snippet, with NOTHING after it. ORACLE = ONE line: a status "
         "code and/or a PLAIN substring that appears in a SUCCESS response -- a bare word, NO backticks, NO "
         "dotted paths (write `token`, not `authentication.token`), e.g. 'ORACLE: status 200 and body contains "
-        "token'. It must be an INDEPENDENT observable that PROVES the foothold/bridge (not a self-printed "
-        "'SUCCESS'), or a SQL SELECT returning proof. STRICTLY NON-DESTRUCTIVE: plant/read for proof, NEVER "
-        "erase/drop/delete/truncate.")
+        "token'. The marker must be DISTINCTIVE -- a string UNIQUE to a SUCCESS response, not a common word "
+        "that also appears on an error/404/empty page (don't pick 'application', 'message', 'error', 'data'); "
+        "prefer a specific value, field name, or a triggered error signature (e.g. 'SQLITE_ERROR'). It must be "
+        "an INDEPENDENT observable that PROVES the foothold/bridge (not a self-printed 'SUCCESS'), or a SQL "
+        "SELECT returning proof. STRICTLY NON-DESTRUCTIVE: plant/read for proof, NEVER erase/drop/delete/truncate.")
     return "\n".join(parts)
 
 

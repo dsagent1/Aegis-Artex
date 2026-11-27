@@ -21,8 +21,16 @@ _STABLE = re.compile(r"Stable tag:\s*([0-9][0-9A-Za-z.\-]*)", re.I)
 _RVER = re.compile(r"^\s*Version:\s*([0-9][0-9A-Za-z.\-]*)", re.I | re.M)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # wp_enum probes a PINNED origin IP + Host: a WP canonical redirect (http origin -> https://<domain>/)
+    # would leave the origin IP for the CDN-fronted domain and hit the WAF (403 -> 0 plugins). Stay put and
+    # read the response we got, so plugin enumeration works over HTTP too (not just HTTPS/no-redirect).
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _opener():
-    handlers = [urllib.request.HTTPSHandler(context=_UCTX)]
+    handlers = [urllib.request.HTTPSHandler(context=_UCTX), _NoRedirect()]
     px = (os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
           or os.environ.get("AEGIS_EGRESS_PROXY") or "").strip()
     if px:

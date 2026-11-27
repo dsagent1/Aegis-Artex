@@ -506,7 +506,14 @@ def _novelcode_http_verdict(oracle_txt, check_verdict, status, body,
     notes = ""
     if check_verdict != "pass":
         return False, "oracle did not pass"
-    if not (200 <= (status or 0) < 300):
+    _ok_2xx = 200 <= (status or 0) < 300
+    # an INJECTION / error proof the oracle EXPLICITLY expects (a triggered 5xx SQL / stack-trace error) is
+    # valid even though non-2xx -- but ONLY with an expected error status AND a distinctive marker, which the
+    # marker + baseline-differential guards below still enforce (so a rate-limited 429 'body~a' stays rejected).
+    _err_proof = (not _ok_2xx and (status or 0) >= 400
+                  and bool(re.search(r"\b5\d\d\b|error|exception|stack ?trace|sqlite|\bsql\b|traceback",
+                                     oracle_txt or "", re.I)))
+    if not _ok_2xx and not _err_proof:
         return False, f"non-2xx status {status} is never a novel-code pass"
     has_select = bool(re.search(r"SELECT\b", oracle_txt or "", re.I))
     m = _NC_MARKER.search(oracle_txt or "")
