@@ -55,6 +55,15 @@ open-source offensive tooling.
 - **Durable evidence capture + replay + automated retest** and **PoE** grading.
 - **Planner** with a techniques DB (curated + learned + MITRE ATT&CK) and a closed write-back loop.
 - **6-model code bench** that emits runnable `TARGET/CODE/ORACLE` blocks, run + confirmed by the operator.
+- **Grounded n-day / patch-diff exploit development** ([docs/GROUNDED_EXPLOIT_DEVELOPMENT.md](docs/GROUNDED_EXPLOIT_DEVELOPMENT.md))
+  — turns a *known* gap into a targeted probe instead of a guess: `patch_differ` diffs the patched vs
+  vulnerable release to locate the changed sink, `cve_research` does live advisory lookup with CPE
+  version-matching (clumpiness-ranked, since vulns cluster), and the **code bench writes the exploit probe**
+  which is then **oracle-verified** — **execution discipline + the diff mechanism + code-exploit probing**
+  wired end-to-end. When no public gap exists, `novel_methodology` grounds the code bench to reason the
+  exploit out; confirmed grounding→working-probe wins are banked as few-shot lessons (`diff_lessons`).
+  `patch_diff_bench` is the confirmable tuning harness that scores working-exploit-code-from-grounding
+  against a live target.
 - **Grey-box fuzzer** (libFuzzer / AFL++ / Honggfuzz / Atheris / Jazzer.js) — crashes verified on reproduce.
 - **Offline vuln RAG** (NVD/KEV/EPSS/Exploit-DB/MSF/nuclei) + a **remediation** closed loop.
 - **Autonomous discover→evaluate→attack loop** with a parallel `content_discovery` sweep (one pass over a
